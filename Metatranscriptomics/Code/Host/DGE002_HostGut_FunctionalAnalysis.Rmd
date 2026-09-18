@@ -1,0 +1,1019 @@
+---
+title: "DGE002_Gut_FunctionalAnalysis"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# =========================================================
+# LOAD LIBRARIES
+# =========================================================
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(GO.db)
+library(clusterProfiler)
+library(enrichplot)
+library(AnnotationDbi)
+library(ggplot2)
+
+citation("vegan")
+
+# =========================================================
+# LOAD eggNOG ANNOTATIONS
+# =========================================================
+annotations <- read.delim(
+  "Spez_eggnog.emapper.annotations",
+  header = FALSE,
+  stringsAsFactors = FALSE,
+  comment.char = "#"
+)
+
+colnames(annotations) <- c(
+  "query_name","seed_ortholog","evalue","score",
+  "eggNOG_OGs","max_annot_lvl","COG_category",
+  "Description","Preferred_name","GOs",
+  "EC","KEGG_ko","KEGG_pathway","KEGG_module",
+  "KEGG_reaction","KEGG_rclass","BRITE",
+  "KEGG_TC","CAZy","BiGG_Reaction","PFAMs"
+)
+
+# =========================================================
+# CLEAN GO TERMS
+# =========================================================
+annot_clean <- annotations %>%
+  mutate(query_name = str_replace(query_name, "\\.t\\d+$", "")) %>%
+  filter(!is.na(GOs), GOs != "-") %>%
+  mutate(GOs = str_replace_all(GOs, "\\s+", "")) %>%
+  separate_rows(GOs, sep = ",") %>%
+  mutate(GO = str_extract(GOs, "GO:\\d{7}")) %>%
+  filter(!is.na(GO)) %>%
+  dplyr::select(gene = query_name, GO) %>%
+  distinct()
+
+# =========================================================
+# TERM2GENE
+# =========================================================
+TERM2GENE <- annot_clean %>%
+  filter(grepl("^GO:\\d{7}$", GO)) %>%
+  distinct(GO, gene)
+
+# =========================================================
+# TERM2NAME
+# =========================================================
+TERM2NAME <- TERM2GENE %>%
+  distinct(GO) %>%
+  mutate(termName = AnnotationDbi::Term(GO)) %>%
+  filter(!is.na(termName)) %>%
+  rename(term = GO)
+
+# =========================================================
+# ADD ONTOLOGY
+# =========================================================
+go_ont <- AnnotationDbi::select(
+  GO.db,
+  keys = unique(TERM2NAME$term),
+  columns = "ONTOLOGY",
+  keytype = "GOID"
+)
+
+TERM2NAME2 <- TERM2NAME %>%
+  left_join(go_ont, by = c("term" = "GOID")) %>%
+  filter(!is.na(ONTOLOGY)) %>%
+  mutate(ONTOLOGY = factor(ONTOLOGY, levels = c("BP", "CC", "MF")))
+
+# =========================================================
+# GENE LIST
+# =========================================================
+geneList <- res_df_clean %>%
+  dplyr::select(Gene, log2FoldChange) %>%
+  filter(!is.na(log2FoldChange)) %>%
+  distinct()
+
+geneList <- setNames(geneList$log2FoldChange, geneList$Gene)
+geneList <- sort(geneList, decreasing = TRUE)
+
+```
+
+
+# Gut
+
+# GO term slimming
+```{r}
+# =========================================================
+# 1. BACKGROUND GENES
+# =========================================================
+background_genes <- unique(
+  str_replace(TERM2GENE$gene, "\\.t\\d+$", "")
+)
+
+# =========================================================
+# 2. DEG GENES
+# =========================================================
+deg_genes_gut <- res_df_clean %>%
+  filter(padj < 0.05) %>%
+  pull(Gene) %>%
+  str_replace("\\.t\\d+$", "") %>%
+  intersect(background_genes)
+
+up_genes <- res_df_clean %>%
+  filter(padj < 0.05, log2FoldChange > 0) %>%
+  pull(Gene) %>%
+  str_replace("\\.t\\d+$", "") %>%
+  intersect(background_genes)
+
+down_genes <- res_df_clean %>%
+  filter(padj < 0.05, log2FoldChange < 0) %>%
+  pull(Gene) %>%
+  str_replace("\\.t\\d+$", "") %>%
+  intersect(background_genes)
+
+go_up <- enricher(
+  gene = up_genes,
+  universe = background_genes,
+  TERM2GENE = TERM2GENE,
+  TERM2NAME = TERM2NAME,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+go_down <- enricher(
+  gene = down_genes,
+  universe = background_genes,
+  TERM2GENE = TERM2GENE,
+  TERM2NAME = TERM2NAME,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  minGSSize = 10,
+  maxGSSize = 500
+)
+
+revigo_up <- as.data.frame(go_up) %>%
+  transmute(
+    GO_ID = ID,
+    value = -log10(p.adjust)
+  ) %>%
+  arrange(desc(value))
+
+revigo_down <- as.data.frame(go_down) %>%
+  transmute(
+    GO_ID = ID,
+    value = -log10(p.adjust)
+  ) %>%
+  arrange(desc(value))
+
+
+write.table(
+  revigo_up,
+  "Revigo_input/revigo_gut_up.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+write.table(
+  revigo_down,
+  "Revigo_input/revigo_gut_down.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+# Read in REVIGO collapsed GO term lists
+```{r}
+revigo_up <- read.delim("Revigo_output/Revigo_BP_gut_up.tsv")
+revigo_down <- read.delim("Revigo_output/Revigo_BP_gut_down.tsv")
+```
+
+
+```{r}
+deg_gene_df <- res_df_clean %>%
+  mutate(
+    Gene = str_replace(Gene, "\\.t\\d+$", "")
+  ) %>%
+  filter(
+    padj < 0.05,
+    !is.na(log2FoldChange)
+  ) %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  transmute(
+    ID = Gene,
+    logFC = log2FoldChange
+  )
+```
+
+# Up
+```{r}
+# =========================================================
+# GUT – UPREGULATED GO CIRCLE (REVIGO FILTERED)
+# =========================================================
+
+library(dplyr)
+library(stringr)
+library(GOplot)
+
+# =========================================================
+# 2. KEEP ONLY REVIGO TERMS
+# =========================================================
+
+ora_up <- as.data.frame(go_up) %>%
+  filter(ID %in% revigo_up$TermID) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 15)
+
+# =========================================================
+# 3. ADD ONTOLOGY
+# =========================================================
+
+ora_up <- ora_up %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("ID" = "term")
+  )
+
+# =========================================================
+# KEEP REVIGO TERMS
+# =========================================================
+
+ora_up <- as.data.frame(go_up) %>%
+  filter(ID %in% revigo_up$TermID) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 15)
+
+# =========================================================
+# BUILD GENE LISTS FROM TERM2GENE
+# =========================================================
+
+go_terms_up <- TERM2GENE %>%
+  filter(GO %in% ora_up$ID) %>%
+  mutate(
+    gene = str_replace(gene, "\\.t\\d+$", "")
+  ) %>%
+  inner_join(
+    deg_gene_df,
+    by = c("gene" = "ID")
+  ) %>%
+  group_by(GO) %>%
+  summarise(
+    genes = paste(unique(gene), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    ora_up %>%
+      dplyr::select(ID, Description, p.adjust),
+    by = c("GO" = "ID")
+  ) %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("GO" = "term")
+  ) %>%
+  transmute(
+    category = ONTOLOGY,
+    ID = GO,
+    term = Description,
+    genes = genes,
+    adj_pval = p.adjust
+  )
+
+circ_up <- circle_dat(
+  go_terms_up,
+  deg_gene_df
+)
+
+Gut_GO_up <- GOCircle(
+  circ_up,
+  nsub = length(unique(circ_up$term)),
+  lfc.col = c("#D4476C","#2C728E")
+)
+
+# For the scale, the z-scores
+range(circ_up$zscore, na.rm = TRUE)
+
+# Make it a ggplot
+Gut_GO_up_gg <- as.ggplot(Gut_GO_up)
+```
+
+```{r}
+# =========================================================
+# GUT – UPREGULATED GO CIRCLE (REVIGO FILTERED)
+# TERMS 16–30
+# =========================================================
+
+library(dplyr)
+library(stringr)
+library(GOplot)
+
+# =========================================================
+# KEEP REVIGO TERMS (16–30)
+# =========================================================
+
+ora_up_2 <- as.data.frame(go_up) %>%
+  filter(ID %in% revigo_up$TermID) %>%
+  arrange(p.adjust) %>%
+  slice(16:30)
+
+# =========================================================
+# ADD ONTOLOGY
+# =========================================================
+
+ora_up_2 <- ora_up_2 %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("ID" = "term")
+  )
+
+# =========================================================
+# BUILD GENE LISTS FROM TERM2GENE
+# =========================================================
+
+go_terms_up_2 <- TERM2GENE %>%
+  filter(GO %in% ora_up_2$ID) %>%
+  mutate(
+    gene = str_replace(gene, "\\.t\\d+$", "")
+  ) %>%
+  inner_join(
+    deg_gene_df,
+    by = c("gene" = "ID")
+  ) %>%
+  group_by(GO) %>%
+  summarise(
+    genes = paste(unique(gene), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    ora_up_2 %>%
+      dplyr::select(ID, Description, p.adjust),
+    by = c("GO" = "ID")
+  ) %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("GO" = "term")
+  ) %>%
+  transmute(
+    category = ONTOLOGY,
+    ID = GO,
+    term = Description,
+    genes = genes,
+    adj_pval = p.adjust
+  )
+
+# =========================================================
+# BUILD GOplot OBJECT
+# =========================================================
+
+circ_up_2 <- circle_dat(
+  go_terms_up_2,
+  deg_gene_df
+)
+
+Gut_GO_up_2 <- GOCircle(
+  circ_up_2,
+  nsub = length(unique(circ_up_2$term)),
+  lfc.col = c("#D4476C", "#2C728E")
+)
+
+# For the scale, the z-scores
+range(circ_up_2$zscore, na.rm = TRUE)
+
+# Make it a ggplot
+Gut_GO_up_2_gg <- as.ggplot(Gut_GO_up_2)
+
+# Inspect
+colnames(circ_up_2)
+
+View(
+  circ_up_2 %>%
+    distinct(ID, .keep_all = TRUE)
+)
+
+# Export
+write.table(
+  circ_up_2,
+  file = "circ_up_2.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+```
+
+
+# Down
+```{r}
+# =========================================================
+# GUT – DOWNREGULATED GO CIRCLE (REVIGO FILTERED)
+# =========================================================
+
+library(dplyr)
+library(stringr)
+library(GOplot)
+
+# =========================================================
+# 2. KEEP ONLY REVIGO TERMS
+# =========================================================
+
+ora_down <- as.data.frame(go_down) %>%
+  filter(ID %in% revigo_down$TermID) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 15)
+
+# =========================================================
+# 3. ADD ONTOLOGY
+# =========================================================
+
+ora_down <- ora_down %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("ID" = "term")
+  )
+
+# =========================================================
+# KEEP REVIGO TERMS
+# =========================================================
+
+ora_down <- as.data.frame(go_down) %>%
+  filter(ID %in% revigo_down$TermID) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 15)
+
+# =========================================================
+# BUILD GENE LISTS FROM TERM2GENE
+# =========================================================
+
+go_terms_down <- TERM2GENE %>%
+  filter(GO %in% ora_down$ID) %>%
+  mutate(
+    gene = str_replace(gene, "\\.t\\d+$", "")
+  ) %>%
+  inner_join(
+    deg_gene_df,
+    by = c("gene" = "ID")
+  ) %>%
+  group_by(GO) %>%
+  summarise(
+    genes = paste(unique(gene), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    ora_down %>%
+      dplyr::select(ID, Description, p.adjust),
+    by = c("GO" = "ID")
+  ) %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("GO" = "term")
+  ) %>%
+  transmute(
+    category = ONTOLOGY,
+    ID = GO,
+    term = Description,
+    genes = genes,
+    adj_pval = p.adjust
+  )
+
+circ_down <- circle_dat(
+  go_terms_down,
+  deg_gene_df
+)
+
+Gut_GO_down <-GOCircle(
+  circ_down,
+  nsub = length(unique(circ_down$term)),
+  lfc.col = c("#D4476C","#2C728E")
+)
+
+# For the scale, the z-scores
+range(circ_down$zscore, na.rm = TRUE)
+
+# Make it a ggplot
+Gut_GO_down_gg <- as.ggplot(Gut_GO_down)
+
+colnames(circ_down)
+
+View(circ_down %>%
+  distinct(ID, .keep_all = TRUE))
+
+write.table(circ_down,
+            file = "circ_down.txt",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+```
+
+```{r}
+# =========================================================
+# GUT – DOWNREGULATED GO CIRCLE (REVIGO FILTERED)
+# TERMS 16–30
+# =========================================================
+
+library(dplyr)
+library(stringr)
+library(GOplot)
+
+# =========================================================
+# KEEP REVIGO TERMS (16–30)
+# =========================================================
+
+ora_down_2 <- as.data.frame(go_down) %>%
+  filter(ID %in% revigo_down$TermID) %>%
+  arrange(p.adjust) %>%
+  slice(16:30)
+
+# =========================================================
+# ADD ONTOLOGY
+# =========================================================
+
+ora_down_2 <- ora_down_2 %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("ID" = "term")
+  )
+
+# =========================================================
+# BUILD GENE LISTS FROM TERM2GENE
+# =========================================================
+
+go_terms_down_2 <- TERM2GENE %>%
+  filter(GO %in% ora_down_2$ID) %>%
+  mutate(
+    gene = str_replace(gene, "\\.t\\d+$", "")
+  ) %>%
+  inner_join(
+    deg_gene_df,
+    by = c("gene" = "ID")
+  ) %>%
+  group_by(GO) %>%
+  summarise(
+    genes = paste(unique(gene), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    ora_down_2 %>%
+      dplyr::select(ID, Description, p.adjust),
+    by = c("GO" = "ID")
+  ) %>%
+  left_join(
+    TERM2NAME2 %>%
+      dplyr::select(term, ONTOLOGY),
+    by = c("GO" = "term")
+  ) %>%
+  transmute(
+    category = ONTOLOGY,
+    ID = GO,
+    term = Description,
+    genes = genes,
+    adj_pval = p.adjust
+  )
+
+# =========================================================
+# BUILD GOplot OBJECT
+# =========================================================
+
+circ_down_2 <- circle_dat(
+  go_terms_down_2,
+  deg_gene_df
+)
+
+Gut_GO_down_2 <- GOCircle(
+  circ_down_2,
+  nsub = length(unique(circ_down_2$term)),
+  lfc.col = c("#D4476C", "#2C728E")
+)
+
+# z-score range
+range(circ_down_2$zscore, na.rm = TRUE)
+
+# Make it a ggplot
+Gut_GO_down_2_gg <- as.ggplot(Gut_GO_down_2)
+
+# Inspect
+colnames(circ_down_2)
+
+View(
+  circ_down_2 %>%
+    distinct(ID, .keep_all = TRUE)
+)
+
+# Export
+write.table(
+  circ_down_2,
+  file = "circ_down_2.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+```
+
+```{r}
+library(patchwork)
+
+Gut_GO_2 <-
+  Gut_GO_up_2_gg /
+  Gut_GO_down_2_gg +
+  plot_annotation(tag_levels = "A") &
+  theme(
+    plot.tag = element_text(face = "bold", size = 14)
+  )
+
+Gut_GO_2
+
+ggsave(
+  filename = "Figures/Gut_GO_2.svg",
+  plot = Gut_GO_2,
+  width = 20,
+  height = 20,
+  units = "in"
+)
+```
+
+# Lipid metabolism-related genes
+```{r}
+go_down_df <- as.data.frame(go_down)
+
+View(go_down_df %>%
+  filter(
+    str_detect(
+      tolower(Description),
+      paste(
+        c(
+          # General lipid terms
+          "lipid",
+          "fatty acid",
+          "fatty-acid",
+          "sterol",
+          "steroid",
+          "cholesterol",
+          "triglyceride",
+          "triacylglycerol",
+          "diacylglycerol",
+          "monoacylglycerol",
+          "glycerolipid",
+          "glycerophospholipid",
+          "phospholipid",
+          "phosphatidyl",
+          "sphingolipid",
+          "sphingomyelin",
+          "ceramide",
+          "glycolipid",
+          "lipoprotein",
+          "lipase",
+
+          # Fat-soluble vitamins
+          "vitamin d",
+          "vitamin a",
+          "retinol",
+          "retinoid",
+          "carotenoid",
+          "tocopherol",
+
+          # Fatty acid metabolism
+          "beta-oxid",
+          "oxidation",
+          "acyl",
+          "acyl-coa",
+          "elongation",
+          "desaturation",
+          "lipogenesis",
+          "lipolysis",
+          "ketone",
+          "ketogenesis",
+          "ketolysis",
+
+          # Transport
+          "lipid transport",
+          "fatty acid transport",
+          "sterol transport",
+          "cholesterol transport",
+          "lipoprotein",
+          "apolipoprotein",
+          "abc transporter",
+          "abc transport",
+          "scavenger receptor",
+
+          # Storage / mobilization
+          "lipid droplet",
+          "adip",
+          "neutral lipid",
+
+          # Peroxisomes
+          "peroxis",
+          "glyoxysome",
+
+          # Steroid / sterol metabolism
+          "steroid catabolic",
+          "steroid metabolic",
+          "steroid biosynthetic",
+          "sterol metabolic",
+          "sterol biosynthetic",
+          "cholesterol metabolic",
+          "cholesterol biosynthetic",
+
+          # Eicosanoids / signaling lipids
+          "eicosanoid",
+          "prostaglandin",
+          "leukotriene",
+          "arachidonic",
+          "linoleic",
+          "omega-3",
+          "omega-6",
+
+          # Membrane lipid remodeling
+          "membrane lipid",
+          "phosphatidylcholine",
+          "phosphatidylethanolamine",
+          "cardiolipin",
+
+          # Hydroxylation by CYPs
+          "hydroxylation"
+        ),
+        collapse = "|"
+      )
+    )
+  ) %>%
+  arrange(p.adjust) %>%
+  dplyr::select(ID, Description, Count, p.adjust))
+```
+
+
+```{r}
+lipid_go_terms <- go_down_df %>%
+  filter(
+    str_detect(
+      tolower(Description),
+      paste(
+        c(
+          # General lipids
+          "lipid",
+          "fatty acid",
+          "fatty-acid",
+          "sterol",
+          "steroid",
+          "cholesterol",
+          "triglyceride",
+          "triacylglycerol",
+          "diacylglycerol",
+          "monoacylglycerol",
+          "glycerolipid",
+          "glycerophospholipid",
+          "phospholipid",
+          "phosphatidyl",
+          "sphingolipid",
+          "sphingomyelin",
+          "ceramide",
+          "glycolipid",
+          "lipoprotein",
+          "lipase",
+
+          # Vitamins / sterols
+          "vitamin d",
+          "vitamin a",
+          "retinol",
+          "retinoid",
+          "carotenoid",
+          "tocopherol",
+
+          # Fatty acid metabolism
+          "beta-oxid",
+          "oxidation",
+          "acyl",
+          "acyl-coa",
+          "elongation",
+          "desaturation",
+          "lipogenesis",
+          "lipolysis",
+          "ketone",
+          "ketogenesis",
+          "ketolysis",
+
+          # Transport
+          "lipid transport",
+          "fatty acid transport",
+          "sterol transport",
+          "cholesterol transport",
+          "apolipoprotein",
+          "scavenger receptor",
+
+          # Peroxisomes
+          "peroxis",
+          "glyoxysome",
+
+          # Steroid / sterol metabolism
+          "steroid catabolic",
+          "steroid metabolic",
+          "steroid biosynthetic",
+          "sterol metabolic",
+          "sterol biosynthetic",
+          "cholesterol metabolic",
+          "cholesterol biosynthetic",
+          "phosphatidylinositol",
+          "oxysterol",
+
+          # Signaling lipids
+          "eicosanoid",
+          "prostaglandin",
+          "leukotriene",
+          "arachidonic",
+          "linoleic",
+
+          # Membrane remodeling
+          "membrane lipid",
+          "phosphatidylcholine",
+          "phosphatidylethanolamine",
+          "cardiolipin",
+
+          # CYP-mediated metabolism
+          "hydroxylation"
+        ),
+        collapse = "|"
+      )
+    )
+  ) %>%
+  pull(ID) %>%
+  unique()
+
+lipid_genes <- TERM2GENE %>%
+  filter(GO %in% lipid_go_terms) %>%
+  distinct(gene)
+
+nrow(lipid_genes)
+
+lipid_annotations <- lipid_genes %>%
+  left_join(
+    annotations %>%
+      mutate(query_name = str_replace(query_name, "\\.t\\d+$", "")),
+    by = c("gene" = "query_name")
+  ) %>%
+  dplyr::select(
+    gene,
+    Preferred_name,
+    Description,
+    EC,
+    KEGG_ko
+  ) %>%
+  distinct()
+
+lipid_deg <- lipid_genes %>%
+  inner_join(
+    res_df_clean %>%
+      mutate(Gene = str_replace(Gene, "\\.t\\d+$", "")) %>%
+      filter(
+        padj < 0.05,
+        !is.na(log2FoldChange)
+      ),
+    by = c("gene" = "Gene")
+  )
+nrow(lipid_deg)
+
+library(DESeq2)
+
+mat <- assay(vsd)
+
+lipid_mat <- mat[
+  rownames(mat) %in% lipid_deg$gene,
+]
+
+gene_labels <- lipid_annotations %>%
+  dplyr::select(gene, Preferred_name) %>%
+  distinct()
+
+rownames(lipid_mat) <- gene_labels$Preferred_name[
+  match(rownames(lipid_mat), gene_labels$gene)
+]
+
+View(lipid_mat)
+
+lipid_mat_z <- t(scale(t(lipid_mat)))
+
+annotation_col <- data.frame(
+  Site = metadata$condition
+)
+
+rownames(annotation_col) <- rownames(metadata)
+
+ann_colors <- list(
+  Site = c(
+    "Reference" = "#2C728E",
+    "Elevated CO2" = "#D4476C"
+  )
+)
+
+clean_labels <- sub(
+  "^[^_]+_([^_]+)_.*",
+  "\\1",
+  colnames(lipid_mat_z)
+)
+
+rownames(annotation_col) <- rownames(metadata)
+
+z_score_colors <- colorRampPalette(
+  c("#2e2eff", "#ffffff", "#ff0902")
+)(100)
+
+# symmetric scale around zero
+max_abs <- max(abs(lipid_mat_z), na.rm = TRUE)
+
+lipid_heatmap <-pheatmap(
+  lipid_mat_z,
+  color = z_score_colors,
+  breaks = seq(-max_abs, max_abs, length.out = 101),
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  labels_col = clean_labels,
+  show_rownames = TRUE,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize_row = 8
+)
+
+# Convert to ggplot
+lipid_heatmap_gg <- as.ggplot(lipid_heatmap)
+
+ggsave(
+  filename = "Figures/Lipid_Metabolism_Heatmap.svg",
+  plot = lipid_heatmap_gg,
+  width = 8,
+  height = 10,
+  units = "in"
+)
+
+```
+
+```{r}
+lipid_mat_collapsed <- lipid_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = gsub("\\..*$", "", Gene)) %>%
+  group_by(Gene) %>%
+  summarise(across(everything(), mean), .groups = "drop") %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+lipid_mat_z_2 <- t(scale(t(lipid_mat_collapsed)))
+
+max_abs_2 <- max(abs(lipid_mat_z), na.rm = TRUE)
+
+lipid_heatmap <- pheatmap(
+  lipid_mat_z_2,
+  color = z_score_colors,
+  breaks = seq(-max_abs_2, max_abs_2, length.out = 101),
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  labels_col = clean_labels,
+  show_rownames = TRUE,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize_row = 8
+)
+
+# Convert to ggplot
+lipid_heatmap_gg <- as.ggplot(lipid_heatmap)
+
+ggsave(
+  filename = "Figures/Lipid_Metabolism_Heatmap.svg",
+  plot = lipid_heatmap_gg,
+  width = 8,
+  height = 4,
+  units = "in"
+)
+```
+
+```{r}
+lipid_deg_table <- lipid_deg %>%
+  dplyr::select(
+    gene,
+    log2FoldChange,
+    padj
+  ) %>%
+  left_join(
+    lipid_annotations,
+    by = "gene"
+  ) %>%
+  arrange(padj)
+
+View(lipid_deg_table)
+
+lipid_deg_table
+
+lipid_deg_table %>%
+  mutate(
+    Direction = ifelse(log2FoldChange > 0, "Up", "Down")
+  ) %>%
+  count(Preferred_name, Direction, sort = TRUE)
+```

@@ -1,0 +1,571 @@
+---
+title: "DGE01_basicDESEQ2"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+set.seed(1234)
+```
+
+# Gut tissue
+```{r}
+library(DESeq2)
+library(dplyr)
+library(tibble)
+
+# -----------------------------
+# 1. Load counts
+# -----------------------------
+counts_df <- read.delim(
+  "salmon.merged.gene_counts.tsv",
+  check.names = FALSE
+)
+
+gene_ids <- counts_df$gene_id
+
+counts_df <- counts_df[, -(1:2)]   # remove gene_id + gene_name
+
+rownames(counts_df) <- gene_ids
+
+counts_mat_raw <- as.matrix(counts_df)
+storage.mode(counts_mat_raw) <- "numeric"
+
+# -----------------------------
+# 2. Load metadata
+# -----------------------------
+metadata <- read.csv("Metadata.csv", row.names = 1)
+
+metadata$condition <- trimws(metadata$condition)
+
+rownames(metadata) <- trimws(rownames(metadata))
+colnames(counts_mat_raw) <- trimws(colnames(counts_mat_raw))
+
+# -----------------------------
+# 3. Alignment check
+# -----------------------------
+stopifnot(all(colnames(counts_mat_raw) %in% rownames(metadata)))
+
+metadata <- metadata[colnames(counts_mat_raw), , drop = FALSE]
+
+stopifnot(all(rownames(metadata) == colnames(counts_mat_raw)))
+
+# -----------------------------
+# 4. Factors
+# -----------------------------
+metadata$condition <- factor(metadata$condition,
+                             levels = c("Reference", "Elevated CO2"))
+
+# =========================================================
+# 5. Create DESeq dataset
+# =========================================================
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(counts_mat_raw),
+  colData = metadata,
+  design = ~ condition
+)
+
+# =========================================================
+# 6. Filter low-count genes
+# =========================================================
+
+keep <- rowSums(counts(dds) >= 10) >= min(table(dds$condition))
+dds <- dds[keep, ]
+
+# =========================================================
+# 7. Run DESeq2
+# =========================================================
+
+dds <- DESeq(dds)
+
+vsd <- vst(dds, blind = FALSE)
+
+resultsNames(dds)
+```
+
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(tibble)
+
+# =========================================================
+# 1. CLEAN VST MATRIX
+# =========================================================
+mat <- assay(vsd)
+
+# remove any non-finite values (safety step)
+mat <- mat[apply(mat, 1, function(x) all(is.finite(x))), ]
+mat <- mat[, apply(mat, 2, function(x) all(is.finite(x)))]
+
+# =========================================================
+# 2. METADATA (MATCH DESeq2 EXACTLY)
+# =========================================================
+meta <- data.frame(
+  condition = colData(vsd)$condition,
+  row.names = colnames(vsd)
+)
+
+meta$condition <- factor(meta$condition,
+                         levels = c("Reference", "Elevated CO2"))
+
+# sanity check
+stopifnot(all(colnames(mat) == rownames(meta)))
+
+# =========================================================
+# 3. PCA FUNCTION
+# =========================================================
+plot_pca_covellipse <- function(vst_mat, sample_meta, title_text,
+                                colors = c("Reference" = "#2C728E",
+                                           "Elevated CO2" = "#D4476C")) {
+
+  library(ggplot2)
+  library(ggrepel)
+
+  sample_meta$condition <- factor(sample_meta$condition,
+                                 levels = c("Reference", "Elevated CO2"))
+
+  # PCA
+  expr_t <- t(vst_mat)
+  pca_res <- prcomp(expr_t, scale. = TRUE)
+
+  # scores
+  pca_scores <- as.data.frame(pca_res$x[, 1:2])
+  colnames(pca_scores) <- c("PC1", "PC2")
+  pca_scores$Sample <- rownames(pca_scores)
+
+  pca_scores <- cbind(
+    pca_scores,
+    sample_meta[rownames(pca_scores), , drop = FALSE]
+  )
+
+  # variance explained
+  percentVar <- round(100 * (pca_res$sdev^2 / sum(pca_res$sdev^2)), 1)
+
+  # ellipse function
+  veganCovEllipse <- function(cov, center = c(0, 0), npoints = 100) {
+    theta <- seq(0, 2 * pi, length.out = npoints)
+    circle <- cbind(cos(theta), sin(theta))
+    t(center + t(circle %*% chol(cov)))
+  }
+
+  # ellipses
+  df_ellipse <- do.call(rbind, lapply(levels(pca_scores$condition), function(g) {
+
+    grp <- pca_scores[pca_scores$condition == g, c("PC1", "PC2")]
+
+    if (nrow(grp) < 2) return(NULL)
+
+    cov_data <- cov.wt(grp)$cov
+    center <- colMeans(grp)
+
+    ellipse <- veganCovEllipse(cov_data, center)
+
+    data.frame(
+      PC1 = ellipse[,1],
+      PC2 = ellipse[,2],
+      condition = g
+    )
+  }))
+
+  # plot
+  ggplot(pca_scores, aes(PC1, PC2, color = condition)) +
+    geom_point(size = 1.5) +
+    geom_path(
+      data = df_ellipse,
+      aes(PC1, PC2, color = condition),
+      linewidth = 0.8,
+      inherit.aes = FALSE
+    ) +
+    scale_color_manual(values = colors) +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    ggtitle(title_text) +
+    coord_equal()
+}
+
+# =========================================================
+# 4. RUN PCA
+# =========================================================
+PCA_cov <- plot_pca_covellipse(
+  mat,
+  meta,
+  "Gut PCA – All Genes"
+)
+
+PCA_cov
+
+# =========================================================
+# 5. SAVE FIGURE
+# =========================================================
+ggsave("figures/Gut_PCA_covEllipse.pdf",
+       PCA_cov,
+       width = 7,
+       height = 6)
+
+```
+
+```{r}
+# -----------------------------
+# PCA using DESeq2-style variable gene selection
+# -----------------------------
+# Similar to DESeq2::plotPCA():
+#   1. Calculate variance for each gene
+#   2. Select top variable genes
+#   3. Run PCA on those genes
+#
+# Unlike plotPCA(), this version adds:
+#   - covariance ellipses
+#   - sample labels
+#   - custom colors
+
+plot_pca_covellipse_deseq <- function(vsd,
+                                      intgroup = "condition",
+                                      title_text,
+                                      ntop = 500,
+                                      colors = c("Reference"    = "#2C728E",
+                                                 "Elevated CO2" = "#D4476C")) {
+  
+  library(ggplot2)
+  library(ggrepel)
+  library(matrixStats)
+  library(dplyr)
+  
+  # -----------------------------
+  # Extract expression matrix
+  # -----------------------------
+  vst_mat <- assay(vsd)
+  
+  # -----------------------------
+  # Select top variable genes
+  # -----------------------------
+  rv <- rowVars(vst_mat)
+  
+  select <- order(rv, decreasing = TRUE)[
+    seq_len(min(ntop, length(rv)))
+  ]
+  
+  vst_mat <- vst_mat[select, ]
+  
+  # -----------------------------
+  # PCA
+  # -----------------------------
+  pca_res <- prcomp(
+    t(vst_mat),
+    scale. = FALSE
+  )
+  
+  # -----------------------------
+  # PCA scores
+  # -----------------------------
+  pca_scores <- as.data.frame(pca_res$x[, 1:2])
+  
+  colnames(pca_scores) <- c("PC1", "PC2")
+  
+  pca_scores$Sample <- rownames(pca_scores)
+  
+  # -----------------------------
+  # Metadata
+  # -----------------------------
+  sample_meta <- as.data.frame(
+    colData(vsd)[, intgroup, drop = FALSE]
+  )
+  
+  # Rename Vent -> Elevated CO2
+  sample_meta[[intgroup]] <- recode(
+    sample_meta[[intgroup]],
+    "Vent" = "Elevated CO2"
+  )
+  
+  pca_scores <- cbind(pca_scores, sample_meta)
+  
+  # Factor order
+  pca_scores[[intgroup]] <- factor(
+    pca_scores[[intgroup]],
+    levels = c("Reference", "Elevated CO2")
+  )
+  
+  # -----------------------------
+  # Percent variance explained
+  # -----------------------------
+  percentVar <- round(
+    100 * (pca_res$sdev^2 / sum(pca_res$sdev^2)),
+    1
+  )
+  
+  # -----------------------------
+  # Covariance ellipse function
+  # -----------------------------
+  veganCovEllipse <- function(cov, center = c(0, 0), npoints = 100) {
+    
+    theta <- seq(0, 2*pi, length.out = npoints)
+    
+    Circle <- cbind(cos(theta), sin(theta))
+    
+    t(center + t(Circle %*% chol(cov)))
+  }
+  
+  # -----------------------------
+  # Build ellipse data
+  # -----------------------------
+  df_ellipse <- do.call(
+    rbind,
+    lapply(levels(pca_scores[[intgroup]]), function(g) {
+      
+      grp_data <- pca_scores[
+        pca_scores[[intgroup]] == g,
+        c("PC1", "PC2")
+      ]
+      
+      if (nrow(grp_data) < 2) return(NULL)
+      
+      cov_data <- cov(grp_data)
+      center <- colMeans(grp_data)
+      
+      ellipse_coords <- veganCovEllipse(cov_data, center)
+      
+      data.frame(
+        PC1 = ellipse_coords[,1],
+        PC2 = ellipse_coords[,2],
+        Group = g
+      )
+    })
+  )
+  
+  # -----------------------------
+  # Plot
+  # -----------------------------
+  ggplot(
+    pca_scores,
+    aes(x = PC1, y = PC2, color = .data[[intgroup]])
+  ) +
+    
+    geom_point(size = 1.5) +
+    
+    geom_path(
+      data = df_ellipse,
+      aes(x = PC1, y = PC2, color = Group),
+      linewidth = 0.8,
+      inherit.aes = FALSE
+    ) +
+    
+    scale_color_manual(values = colors, drop = FALSE) +
+    
+    theme_bw() +
+    
+    theme(
+      panel.grid = element_blank()
+    ) +
+    
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    
+    ggtitle(title_text) +
+    
+    coord_equal()
+}
+
+# -----------------------------
+# Run PCA
+# -----------------------------
+vsd_pca <- plot_pca_covellipse_deseq(
+  vsd,
+  intgroup = "condition",
+  title_text = "Top 500 Variable Genes"
+)
+
+vsd_pca
+```
+
+# Volcano plot
+```{r}
+# ===============================
+# Wald test + apeglm shrinkage
+# ===============================
+
+# Standard DESeq2 statistical test
+res_raw <- results(
+  dds,
+  contrast = c("condition", "Elevated CO2", "Reference")
+)
+
+# Shrink log2 fold-changes using apeglm
+res_wald <- lfcShrink(
+  dds,
+  coef = "condition_Elevated.CO2_vs_Reference",
+  type = "apeglm"
+)
+
+summary(res_wald)
+
+# =============================
+# Function to create volcano plots
+# =============================
+
+volcano_plot <- function(res_df, title_text) {
+  
+  library(ggplot2)
+  library(dplyr)
+  
+  # -----------------------------
+  # Recode significance by direction
+  # -----------------------------
+  res_df <- res_df %>%
+    
+    mutate(
+  sig_dir = case_when(
+    padj < 0.05 & log2FoldChange >= 1  ~ "Up",
+    padj < 0.05 & log2FoldChange <= -1 ~ "Down",
+    TRUE ~ "Not significant"
+  )
+) %>%
+mutate(
+  sig_dir = factor(
+    sig_dir,
+    levels = c(
+      "Up",
+      "Not significant",
+      "Down"
+    )
+  )
+)
+  
+  # -----------------------------
+  # Symmetric x-axis limit
+  # -----------------------------
+  max_abs <- ceiling(
+    max(abs(res_df$log2FoldChange), na.rm = TRUE)
+  )
+  
+  # Ensure minimum reasonable range
+  max_abs <- max(max_abs, 2)
+  
+  # X-axis breaks
+  x_breaks <- seq(-max_abs, max_abs, by = 1)
+  
+  # -----------------------------
+  # Plot
+  # -----------------------------
+  ggplot(
+    res_df,
+    aes(
+      x = log2FoldChange,
+      y = -log10(padj)
+    )
+  ) +
+    
+    geom_point(
+      aes(color = sig_dir),
+      alpha = 0.6,
+      size = 1.5
+    ) +
+    
+    scale_color_manual(
+      values = c(
+        "Up" = "#D4476C",
+        "Not significant" = "gray70",
+        "Down"    = "#2C728E"
+      )
+    ) +
+    
+    geom_vline(
+      xintercept = c(-1, 1),
+      linetype = "dashed"
+    ) +
+    
+    geom_vline(
+      xintercept = 0,
+      color = "black"
+    ) +
+    
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dashed"
+    ) +
+    
+    labs(
+      title = title_text,
+      x = expression(Log[2]~fold~change),
+      y = expression(-Log[10]~adjusted~italic(P))
+    ) +
+    
+    scale_x_continuous(
+      limits = c(-max_abs, max_abs),
+      breaks = x_breaks
+    ) +
+    
+    scale_y_continuous(
+      limits = c(0, NA)
+    ) +
+    
+    theme_minimal() +
+    
+    theme(
+      panel.grid = element_blank(),
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 1
+      ),
+      axis.ticks = element_line(
+        color = "black",
+        linewidth = 0.3
+      ),
+      legend.title = element_blank()
+    )
+}
+
+# ==========================
+# Prepare results dataframe
+# ==========================
+
+res_df_clean <- as.data.frame(res_wald) %>%
+  
+  tibble::rownames_to_column("Gene") %>%
+  
+  filter(
+    !is.na(log2FoldChange),
+    !is.na(padj),
+    padj > 0
+  )
+
+# ==========================
+# Volcano plot
+# ==========================
+
+volcano <- volcano_plot(
+  res_df_clean,
+  "Volcano Plot (Elevated CO2 vs Reference)"
+)
+
+volcano
+```
+
+# Gut DESEQ2 figures
+```{r}
+library(patchwork)
+
+DESEQ_figs_gut <- (PCA_cov | volcano) /
+  heatmap_gg +
+  plot_layout(heights = c(1, 2)) +
+  plot_annotation(tag_levels = "A") &
+  theme(
+    plot.tag = element_text(face = "bold", size = 14)
+  )
+
+DESEQ_figs_gut
+
+ggsave(
+  filename = "Figures/DESEQ_figs_gut.svg",
+  plot = DESEQ_figs_gut,
+  width = 10,
+  height = 10,
+  units = "in"
+)
+```
