@@ -1,0 +1,158 @@
+---
+title: "04a_AlphaDiversity"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Alpha Diversity Plots
+```{r}
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# conflicts with phyloseq
+unloadNamespace("philr")
+unloadNamespace("ggtree")
+unloadNamespace("treeio")
+unloadNamespace("tidytree")
+
+sample_data(ps_gut_clean)
+alpha_diversity <- estimate_richness(tax_glom(ps_gut_clean, taxrank = "Genus"), measure = c("Shannon", "Observed"))
+names(alpha_diversity)[names(alpha_diversity) == "Observed"] <- "Richness"
+names(alpha_diversity)[names(alpha_diversity) == "Shannon"] <- "Diversity"
+alpha_diversity$Evenness <- alpha_diversity$Diversity / log(alpha_diversity$Richness)
+alpha_diversity <- data.frame(alpha_diversity, sample_data(ps_gut_clean))
+
+alpha_long <- alpha_diversity %>%
+  pivot_longer(cols = c(Diversity, Richness, Evenness),
+               names_to = "Measure", values_to = "Value") %>%
+mutate(Site = factor(Condition, levels = c("Reference", "Elevated CO2")))
+
+# --- Pivot and recode alpha diversity ---
+alpha_long <- alpha_diversity %>%
+  pivot_longer(
+    cols = c(Diversity, Richness, Evenness),
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Site = factor(Condition,
+      levels = c("Reference", "Elevated CO2")
+    )
+  )
+
+# Map old names to final facet labels
+measure_labels <- c(
+  "Evenness" = "Evenness",
+  "Richness" = "Richness",
+  "Diversity" = "Shannon"
+)
+
+# Apply mapping and set factor levels
+alpha_long$Measure <- factor(measure_labels[alpha_long$Measure],
+                             levels = c("Evenness", "Richness", "Shannon"))
+
+# --- Plot ---
+disp.pal1 <- c("#2C728E", "#D4476C") 
+disp.pal2 <- c("#1F4E64", "#9B3654")
+
+library(ggpubr)
+
+# Significance based on ANOVA (chunk below)
+sig_df <- data.frame(
+  Measure = c("Evenness", "Shannon"),
+  group1 = c("Reference", "Reference"),
+  group2 = c("Elevated CO2", "Elevated CO2"),
+  y.position = c(0.47, 2.4),
+  label = c("**", "**")
+)
+
+combined_alpha_plots <- ggplot(alpha_long, aes(x = Site, y = Value)) + 
+  stat_boxplot(aes(colour = Site), geom = 'errorbar', alpha = 1) + 
+  geom_boxplot(aes(fill = Site, colour = Site)) +
+  geom_jitter(aes(fill = Site, colour = Site),
+              shape = 21, width = 0.1, size = 2.5, alpha = 0.8,
+              show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 23, size = 2.5, colour = "black", fill = "white",
+               position = position_dodge(width = 0.75),
+               show.legend = FALSE) +
+  scale_fill_manual(values = disp.pal1,
+                    labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_colour_manual(values = disp.pal2,
+                      labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_x_discrete(name = "Site",
+                   labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_y_continuous(
+  name = "Alpha Diversity Measure",
+  breaks = scales::pretty_breaks(n = 5),
+  expand = expansion(mult = c(0.5, 0.5))
+) +
+  facet_wrap(~Measure, scales = "free", ncol = 3) +
+  stat_pvalue_manual(
+    sig_df,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    inherit.aes = FALSE,
+    tip.length = 0.01,
+    bracket.size = 0.5
+  ) + theme_classic(base_size = 14) +
+  theme(axis.title.x = element_blank(),
+        panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+        legend.position = "none",
+        plot.title = element_text(size = 14),
+        axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+
+# --- Show plot ---
+combined_alpha_plots
+
+# --- Save plot ---
+ggsave("Figures_Alpha_Beta_div/combined_alpha_plots_clean.svg", combined_alpha_plots,
+       width = 23, height = 12, units = "cm", dpi = 900)
+```
+
+#Stats
+```{r}
+library(car)
+
+leveneTest(Richness ~ Condition, data = alpha_diversity) #NS = assumptions met
+anov_richness_tissue <- aov(Richness ~ Condition, data = alpha_diversity) 
+summary(anov_richness_tissue)
+#p adj ns
+
+leveneTest(Evenness ~ Condition, data = alpha_diversity) #NS = assumptions met
+anov_evenness_tissue <- aov(Evenness ~ Condition, data = alpha_diversity)
+summary(anov_evenness_tissue)
+# p adj = 0.00317 **
+
+leveneTest(Diversity ~ Condition, data = alpha_diversity) #NS = assumptions met
+anov_shannon_tissue <- aov(Diversity ~ Condition, data = alpha_diversity)
+summary(anov_shannon_tissue)
+# p adj 0.00492 **
+
+# No differences in gut community Richness
+# Higher Evenness and Shannon Diversity in Elevated CO2
+
+par(mfrow = c(1,3))
+
+qqnorm(residuals(anov_richness_tissue))
+qqline(residuals(anov_richness_tissue))
+
+qqnorm(residuals(anov_evenness_tissue))
+qqline(residuals(anov_evenness_tissue))
+
+qqnorm(residuals(anov_shannon_tissue))
+qqline(residuals(anov_shannon_tissue))
+
+par(mfrow = c(1,1))
+
+```
