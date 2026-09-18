@@ -1,0 +1,1503 @@
+---
+title: "PostKrakenBacterialMetatranscriptome"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Diamond taxonomy load
+```{r}
+library(data.table)
+library(dplyr)
+
+# DIAMOND
+diamond <- fread(
+  "PostKraken2/transcripts_gtdb.tsv",
+  header = FALSE
+)
+
+colnames(diamond) <- c(
+  "ORF",
+  "subject",
+  "taxid",
+  "pident",
+  "aln_length",
+  "evalue",
+  "bitscore"
+)
+
+# GTDB nodes
+nodes <- fread(
+  "DIAMOND_tax_R_files/gtdb-r220.nodes.dmp",
+  sep="|",
+  header=FALSE,
+  fill=TRUE,
+  strip.white=TRUE
+)
+
+nodes <- nodes[, .(
+  taxid = V1,
+  parent = V2,
+  rank = V3
+)]
+
+# GTDB names
+names <- fread(
+  "DIAMOND_tax_R_files/gtdb-r220.names.dmp",
+  sep="|",
+  header=FALSE,
+  fill=TRUE,
+  strip.white=TRUE
+)
+
+names <- names[, .(
+  taxid = V1,
+  name = V2
+)]
+
+nodes$rank <- trimws(nodes$rank)
+
+names$name <- trimws(names$name)
+
+head(nodes)
+head(names)
+
+sort(unique(nodes$rank))
+length(unique(diamond$taxid))
+```
+
+# Make taxonomy lookup table 
+```{r}
+# ------------------------------------------------------------------
+# Build lookup vectors
+# ------------------------------------------------------------------
+
+parent_lookup <- setNames(nodes$parent, nodes$taxid)
+rank_lookup   <- setNames(nodes$rank, nodes$taxid)
+name_lookup   <- setNames(names$name, names$taxid)
+
+# ------------------------------------------------------------------
+# Function to recover full lineage for one taxid
+# ------------------------------------------------------------------
+
+get_lineage <- function(taxid){
+
+  lineage <- c(
+    superkingdom = NA,
+    phylum = NA,
+    class = NA,
+    order = NA,
+    family = NA,
+    genus = NA,
+    species = NA
+  )
+
+  current <- as.character(taxid)
+
+  visited <- character()
+
+  while(!is.na(current) &&
+        current %in% names(parent_lookup) &&
+        !(current %in% visited)){
+
+    visited <- c(visited, current)
+
+    rank <- rank_lookup[current]
+    name <- name_lookup[current]
+
+    if(rank %in% names(lineage)){
+      lineage[rank] <- name
+    }
+
+    parent <- parent_lookup[current]
+
+    if(is.na(parent) || parent == current){
+      break
+    }
+
+    current <- as.character(parent)
+  }
+
+  data.frame(
+    taxid = as.character(taxid),
+    t(lineage),
+    stringsAsFactors = FALSE
+  )
+}
+
+# ------------------------------------------------------------------
+# Build taxonomy table for all DIAMOND taxids
+# ------------------------------------------------------------------
+
+unique_taxids <- unique(as.character(diamond$taxid))
+
+taxonomy_table <- rbindlist(
+  lapply(unique_taxids, get_lineage),
+  fill = TRUE
+)
+
+# ------------------------------------------------------------------
+# Inspect
+# ------------------------------------------------------------------
+
+dim(taxonomy_table)
+
+head(taxonomy_table)
+
+table(taxonomy_table$superkingdom)
+```
+
+```{r}
+fwrite(
+  taxonomy_table,
+  "PostKraken2/diamond_taxonomy_table.tsv",
+  sep = "\t"
+)
+
+taxonomy_table <- fread("PostKraken2/diamond_taxonomy_table.tsv")
+```
+
+```{r}
+diamond$taxid <- as.character(diamond$taxid)
+taxonomy_table$taxid <- as.character(taxonomy_table$taxid)
+
+diamond_tax <- left_join(
+  diamond,
+  taxonomy_table,
+  by = "taxid"
+) 
+
+View(diamond_tax)
+```
+
+# Load salmon results 
+# No need to run again, just load the RDS in the chunk below
+```{r}
+library(data.table)
+
+# ------------------------------------------------------------------
+# Find Salmon files
+# ------------------------------------------------------------------
+
+files <- list.files(
+  "PostKraken2/Read_mapping_salmon",
+  pattern = "_quant\\.sf$",
+  full.names = TRUE
+)
+
+# ------------------------------------------------------------------
+# Pass 1: count samples with >0 reads within each treatment
+# ------------------------------------------------------------------
+
+counts <- NULL
+
+for(i in seq_along(files)) {
+
+  sample_name <- basename(files[i])
+
+  cat("Counting:", sample_name, "\n")
+
+  dt <- fread(
+    files[i],
+    select = c("Name", "NumReads")
+  )
+
+  detected <- as.integer(dt$NumReads > 1)
+
+  if(i == 1) {
+
+    counts <- data.table(
+      ORF = dt$Name,
+      C = 0L,
+      H = 0L
+    )
+
+  }
+
+  if(grepl("^C", sample_name)) {
+
+    counts$C <- counts$C + detected
+
+  } else if(grepl("^H", sample_name)) {
+
+    counts$H <- counts$H + detected
+
+  } else {
+
+    stop("Unknown sample name: ", sample_name)
+
+  }
+
+  rm(dt, detected)
+  gc()
+}
+
+# ------------------------------------------------------------------
+# Keep ORFs with >0 reads in >=7 samples of either treatment
+# ------------------------------------------------------------------
+
+keep_orfs <- counts[
+  C >= 7 | H >= 7,
+  ORF
+]
+
+cat("ORFs retained:", length(keep_orfs), "\n")
+
+# Counts table no longer needed
+rm(counts)
+gc()
+
+# ------------------------------------------------------------------
+# Pass 2: load only retained ORFs
+# ------------------------------------------------------------------
+
+salmon_list <- vector("list", length(files))
+
+for(i in seq_along(files)) {
+
+  cat("Loading:", basename(files[i]), "\n")
+
+  sample_name <- sub(
+    "_quant\\.sf$",
+    "",
+    basename(files[i])
+  )
+
+  dt <- fread(
+    files[i],
+    select = c("Name", "TPM", "NumReads")
+  )
+
+  dt <- dt[Name %in% keep_orfs]
+
+  setnames(dt, "Name", "ORF")
+
+  dt[, Sample := sample_name]
+
+  salmon_list[[i]] <- dt
+
+  rm(dt)
+  gc()
+}
+
+salmon_filtered <- rbindlist(salmon_list)
+
+# ------------------------------------------------------------------
+# Check result
+# ------------------------------------------------------------------
+
+print(dim(salmon_filtered))
+head(salmon_filtered)
+
+# ------------------------------------------------------------------
+# Save filtered object
+# ------------------------------------------------------------------
+
+saveRDS(
+  salmon_filtered,
+  "PostKraken2/00_TempData/salmon_filtered.rds",
+  compress = "xz"
+)
+```
+
+```{r}
+salmon_filtered <- readRDS("PostKraken2/00_TempData/salmon_filtered.rds")
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(compositions)
+library(ggplot2)
+
+# =========================================================
+# 1. Species-level abundance table
+# =========================================================
+
+bac_sp <- bac %>%
+  mutate(species = ifelse(is.na(species), "Unassigned", species)) %>%
+  group_by(Sample, Site, species) %>%
+  summarise(reads = sum(NumReads, na.rm = TRUE), .groups = "drop")
+
+sp_mat <- bac_sp %>%
+  pivot_wider(
+    names_from = species,
+    values_from = reads,
+    values_fill = 0
+  )
+
+# =========================================================
+# 2. Build matrix + metadata (SAFE ALIGNMENT)
+# =========================================================
+
+meta <- sp_mat %>%
+  dplyr::select(Sample, Site) %>%
+  tibble::column_to_rownames("Sample")
+
+mat <- sp_mat %>%
+  dplyr::select(-Sample, -Site)
+
+mat <- as.matrix(mat)
+
+rownames(mat) <- sp_mat$Sample
+
+# ensure numeric (IMPORTANT safety step)
+storage.mode(mat) <- "numeric"
+
+# align metadata
+meta <- meta[rownames(mat), , drop = FALSE]
+
+stopifnot(all(rownames(meta) == rownames(mat)))
+
+# =========================================================
+# 3. CLR transform
+# =========================================================
+
+mat_clr <- clr(mat + 1)
+
+# =========================================================
+# 4. PCA (CLR space)
+# =========================================================
+
+pca <- prcomp(mat_clr, scale. = FALSE)
+
+percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)), 1)
+
+scores <- as.data.frame(pca$x[, 1:2])
+scores$Sample <- rownames(scores)
+scores <- cbind(scores, meta)
+
+# =========================================================
+# 5. Ellipses (PC1 vs PC2)
+# =========================================================
+
+veganCovEllipse <- function(cov, center = c(0, 0), npoints = 100) {
+  theta <- seq(0, 2 * pi, length.out = npoints)
+  circle <- cbind(cos(theta), sin(theta))
+  t(center + t(circle %*% chol(cov)))
+}
+
+scores$Site <- factor(scores$Site)
+
+ell <- do.call(rbind, lapply(levels(scores$Site), function(g) {
+
+  grp <- scores[scores$Site == g, c("PC1", "PC2")]
+
+  if (nrow(grp) < 3) return(NULL)  # slightly stricter for stability
+
+  cov_data <- cov.wt(grp)$cov
+  center <- colMeans(grp)
+
+  e <- veganCovEllipse(cov_data, center)
+
+  data.frame(
+    PC1 = e[,1],
+    PC2 = e[,2],
+    Site = g
+  )
+}))
+
+# =========================================================
+# 6. Plot (PC1 vs PC2 only)
+# =========================================================
+
+ggplot(scores, aes(PC1, PC2, color = Site)) +
+  geom_point(size = 1.5) +
+  geom_path(
+    data = ell,
+    aes(PC1, PC2, color = Site),
+    linewidth = 0.8,
+    inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = c(
+    "Reference" = "#2C728E",
+    "Elevated CO2" = "#D4476C"
+  )) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = paste0("PC1 (", percentVar[1], "% variance)"),
+    y = paste0("PC2 (", percentVar[2], "% variance)"),
+    title = "Species-level CLR PCA"
+  )
+```
+
+# Expression analysis (DESEQ2)
+```{r}
+library(tidyr)
+library(DESeq2)
+
+length(unique(salmon_filtered$ORF))
+
+counts_mat <- salmon_filtered %>%
+  dplyr::select(ORF, Sample, NumReads) %>%
+  pivot_wider(
+    names_from = Sample,
+    values_from = NumReads,
+    values_fill = 0
+  )
+
+counts_df <- as.data.frame(counts_mat)
+
+rownames(counts_df) <- counts_df$ORF
+
+counts_df$ORF <- NULL
+
+counts_mat_raw <- as.matrix(counts_df)
+dim(counts_mat_raw)
+
+storage.mode(counts_mat_raw) <- "numeric"
+
+metadata <- data.frame(
+  Site = c(
+    rep("Reference", 14),
+    rep("Elevated CO2", 17)
+  ),
+  row.names = colnames(counts_mat_raw)
+)
+
+dim(counts_mat_raw)
+
+colnames(counts_mat_raw)
+
+# Altered filtered low counts, so 
+dds <- DESeqDataSetFromMatrix(
+  countData = round(counts_mat_raw),
+  colData = metadata,
+  design = ~ Site
+)
+
+metadata <- as.data.frame(colData(dds))
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# VST
+vsd <- varianceStabilizingTransformation(dds, blind = FALSE)
+
+```
+
+# Load in so don't need to re-run deseq
+```{r}
+saveRDS(
+  dds,
+  file = "PostKraken2/00_TempData/microbial_dds.rds"
+)
+
+saveRDS(
+  vsd,
+  file = "PostKraken2/00_TempData/microbial_vsd.rds"
+)
+
+dds <- readRDS("PostKraken2/00_TempData/microbial_dds.rds")
+
+vsd <- readRDS("PostKraken2/00_TempData/microbial_vsd.rds")
+```
+
+# Site-wise PCA (all transcripts)
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+
+# =========================================================
+# Extract VST matrix and metadata
+# =========================================================
+
+vst_mat <- assay(vsd)
+metadata <- as.data.frame(colData(dds))
+
+stopifnot(identical(colnames(vst_mat), rownames(metadata)))
+
+# =========================================================
+# PCA plotting function
+# =========================================================
+
+plot_pca_ellipses <- function(
+  vst_mat,
+  sample_meta,
+  title_text,
+  colors = c(
+    "Reference" = "#2C728E",
+    "Elevated CO2" = "#D4476C"
+  )
+){
+
+  sample_meta$Site <- factor(
+    sample_meta$Site,
+    levels = c("Reference", "Elevated CO2")
+  )
+
+  stopifnot(identical(colnames(vst_mat),
+                      rownames(sample_meta)))
+
+  # PCA on samples
+  expr_t <- t(vst_mat)
+
+  pca_res <- prcomp(
+    expr_t,
+    scale. = FALSE
+  )
+
+  percentVar <- round(
+    100 * (pca_res$sdev^2 / sum(pca_res$sdev^2)),
+    1
+  )
+
+  pca_scores <- as.data.frame(
+    pca_res$x[,1:3]
+  )
+
+  colnames(pca_scores) <- c("PC1","PC2","PC3")
+
+  pca_scores$Sample <- rownames(pca_scores)
+
+  pca_scores <- cbind(
+    pca_scores,
+    sample_meta[rownames(pca_scores), , drop = FALSE]
+  )
+
+  # -------------------------------------------------------
+  # Ellipse helper
+  # -------------------------------------------------------
+
+  veganCovEllipse <- function(cov,
+                              center = c(0,0),
+                              npoints = 100){
+
+    theta <- seq(0, 2*pi, length.out = npoints)
+
+    circle <- cbind(
+      cos(theta),
+      sin(theta)
+    )
+
+    t(
+      center +
+        t(circle %*% chol(cov))
+    )
+  }
+
+  make_ellipse <- function(x, y){
+
+    do.call(rbind,
+      lapply(levels(pca_scores$Site), function(g){
+
+        grp <- pca_scores[
+          pca_scores$Site == g,
+          c(x,y)
+        ]
+
+        if(nrow(grp) < 3)
+          return(NULL)
+
+        if(any(!is.finite(as.matrix(grp))))
+          return(NULL)
+
+        cov_data <- cov(grp)
+
+        if(det(cov_data) <= 0)
+          return(NULL)
+
+        center <- colMeans(grp)
+
+        ell <- veganCovEllipse(
+          cov_data,
+          center
+        )
+
+        data.frame(
+          x = ell[,1],
+          y = ell[,2],
+          Site = g
+        )
+
+      })
+    )
+
+  }
+
+  ell12 <- make_ellipse("PC1","PC2")
+  ell13 <- make_ellipse("PC1","PC3")
+  ell23 <- make_ellipse("PC2","PC3")
+
+  # -------------------------------------------------------
+  # Plot helper
+  # -------------------------------------------------------
+
+  base_plot <- function(x,y,ell,xlab,ylab){
+
+    ggplot(
+      pca_scores,
+      aes_string(
+        x = x,
+        y = y,
+        colour = "Site"
+      )
+    ) +
+
+      geom_point(size = 2) +
+
+      geom_path(
+        data = ell,
+        aes(
+          x = x,
+          y = y,
+          colour = Site
+        ),
+        linewidth = 0.8,
+        inherit.aes = FALSE
+      ) +
+
+      scale_color_manual(values = colors) +
+
+      labs(
+        x = xlab,
+        y = ylab,
+        title = title_text
+      ) +
+
+      theme_bw() +
+
+      theme(
+        panel.grid = element_blank(),
+        legend.position = "bottom"
+      )
+
+  }
+
+  p1 <- base_plot(
+    "PC1",
+    "PC2",
+    ell12,
+    paste0("PC1 (",percentVar[1],"%)"),
+    paste0("PC2 (",percentVar[2],"%)")
+  ) 
+
+  p2 <- base_plot(
+    "PC1",
+    "PC3",
+    ell13,
+    paste0("PC1 (",percentVar[1],"%)"),
+    paste0("PC3 (",percentVar[3],"%)")
+  )
+
+  p3 <- base_plot(
+    "PC2",
+    "PC3",
+    ell23,
+    paste0("PC2 (",percentVar[2],"%)"),
+    paste0("PC3 (",percentVar[3],"%)")
+  )
+
+  (p1 + p2 + p3) +
+    plot_annotation(
+      tag_levels = "A"
+    ) +
+    plot_layout(
+      guides = "collect"
+    ) &
+    theme(
+      legend.position = "right",
+      plot.tag = element_text(
+        face = "bold",
+        size = 14
+      )
+    )
+
+}
+
+# =========================================================
+# Create PCA
+# =========================================================
+
+PCA_microbes <- plot_pca_ellipses(
+  vst_mat = vst_mat,
+  sample_meta = metadata,
+  title_text = ""
+) 
+
+PCA_microbes
+
+# =========================================================
+# Save figure
+# =========================================================
+
+ggsave(
+  "PostKraken2/Figures/Microbial_PCA.svg",
+  PCA_microbes,
+  width = 10,
+  height = 4
+)
+```
+
+# Statistical test (Reference vs Elevated CO2 expression pattern - all ORFs)
+```{r}
+nrow(dds)
+
+library(vegan)
+
+# samples x genes
+expr_t <- t(vst_mat)
+
+# Euclidean distance on VST values
+dist_mat <- dist(expr_t, method = "euclidean")
+
+# PERMANOVA
+adonis_all <- adonis2(
+  dist_mat ~ Site,
+  data = metadata,
+  permutations = 999,
+  seed = 1234
+)
+
+adonis_all
+
+#adonis2(formula = dist_mat ~ Site, data = metadata, permutations = 999, seed = 1234)
+#         Df SumOfSqs     R2      F Pr(>F)  
+#Model     1    14879 0.0779 2.4501  0.017 *
+#Residual 29   176117 0.9221                
+#Total    30   190996 1.0000     
+
+# Test homogeneity of dispersion
+bd_all <- betadisper(
+  dist_mat,
+  metadata$Site
+)
+
+anova(bd_all)
+
+#Response: Distances
+#          Df Sum Sq Mean Sq F value  Pr(>F)  
+#Groups     1 1228.7 1228.70  4.4697 0.04322 *
+#Residuals 29 7971.9  274.89  
+
+permutest(
+  bd_all,
+  permutations = 999,
+  seed = 1234
+)
+
+#Response: Distances
+#          Df Sum Sq Mean Sq      F N.Perm Pr(>F)  
+#Groups     1 1228.7 1228.70 4.4697    999  0.043 *
+#Residuals 29 7971.9  274.89   
+```
+
+
+# Bacterial assigned ORFs only
+```{r}
+library(dplyr)
+library(tidyr)
+library(DESeq2)
+
+# =========================================================
+# Build count matrix from bacterial ORFs only
+# =========================================================
+
+counts_mat <- bac %>%
+  dplyr::select(ORF, Sample, NumReads) %>%
+  pivot_wider(
+    names_from = Sample,
+    values_from = NumReads,
+    values_fill = 0
+  )
+
+counts_df <- as.data.frame(counts_mat)
+
+rownames(counts_df) <- counts_df$ORF
+counts_df$ORF <- NULL
+
+counts_mat_raw <- as.matrix(counts_df)
+
+storage.mode(counts_mat_raw) <- "numeric"
+
+# =========================================================
+# Metadata
+# =========================================================
+
+metadata <- data.frame(
+  Site = c(
+    rep("Reference", 14),
+    rep("Elevated CO2", 17)
+  ),
+  row.names = colnames(counts_mat_raw)
+)
+
+# =========================================================
+# DESeq2 dataset
+# =========================================================
+
+dds_bac <- DESeqDataSetFromMatrix(
+  countData = round(counts_mat_raw),
+  colData = metadata,
+  design = ~ Site
+)
+
+# Remove genes with zero counts
+dds_bac <- dds_bac[rowSums(counts(dds_bac)) > 0, ]
+
+# =========================================================
+# Run DESeq2
+# =========================================================
+
+dds_bac  <- DESeq(dds_bac)
+
+# =========================================================
+# Variance stabilizing transformation
+# =========================================================
+
+vsd_bac <- varianceStabilizingTransformation(
+  dds_bac ,
+  blind = FALSE
+)
+
+# =========================================================
+# Save objects
+# =========================================================
+
+saveRDS(
+  dds_bac ,
+  file = "PostKraken2/00_TempData/bacterial_only_dds.rds"
+)
+
+saveRDS(
+  vsd_bac,
+  file = "PostKraken2/00_TempData/bacterial_only_vsd.rds"
+)
+
+# =========================================================
+# PCA
+# =========================================================
+
+vst_mat_bac <- assay(vsd_bac)
+metadata_bac <- as.data.frame(colData(dds_bac))
+
+PCA_microbes <- plot_pca_ellipses(
+    vst_mat = vst_mat_bac,
+    sample_meta = metadata_bac,
+    title_text = ""
+)
+
+PCA_microbes
+
+ggsave(
+  "PostKraken2/Figures/Bacterial_ORF_PCA.svg",
+  PCA_microbes,
+  width = 10,
+  height = 4
+)
+```
+
+# Statistical test (Reference vs Elevated CO2 expression pattern - All ORFs and Bacteria only)
+```{r}
+nrow(dds_bac)
+#### Bacteria only #####
+library(vegan)
+
+vst_mat_bac <- assay(vsd_bac)
+metadata_bac <- as.data.frame(colData(dds_bac))
+
+# samples x genes
+expr_t_bac <- t(vst_mat_bac)
+
+# Euclidean distance on VST values
+dist_mat_bac <- dist(expr_t_bac, method = "euclidean")
+
+# PERMANOVA
+adonis_bacteria <- adonis2(
+  dist_mat_bac ~ Site,
+  data = metadata_bac,
+  permutations = 999,
+  seed = 1234
+)
+
+adonis_bacteria
+
+#adonis2(formula = dist_mat_bac ~ Site, data = metadata_bac, permutations = 999, seed = 1234)
+#         Df SumOfSqs      R2      F Pr(>F)  
+#Model     1    13853 0.07684 2.4137  0.019 *
+#Residual 29   166435 0.92316                
+#Total    30   180287 1.00000  
+
+# Test homogeneity of dispersion
+bd_bacteria <- betadisper(
+  dist_mat_bac,
+  metadata_bac$Site
+)
+
+anova(bd_bacteria)
+
+#Response: Distances
+#          Df Sum Sq Mean Sq F value  Pr(>F)  
+#Groups     1 1200.6 1200.58  4.7747 0.03711 *
+#Residuals 29 7291.9  251.44    
+
+permutest(
+  bd_bacteria,
+  permutations = 999,
+  seed = 1234
+)
+
+#Response: Distances
+#          Df Sum Sq Mean Sq      F N.Perm Pr(>F)  
+#Groups     1 1200.6 1200.58 4.7747    999  0.041 *
+#Residuals 29 7291.9  251.44  
+```
+
+# KEGG Pathways
+```{r}
+BiocManager::install(c(
+  "clusterProfiler",
+  "enrichplot",
+  "DOSE"
+))
+
+# ============================================================
+# 0. LIBRARIES
+# ============================================================
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(DESeq2)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+
+# ============================================================
+# 1. LOAD SALMON DATA
+# ============================================================
+#salmon_filtered <- readRDS("00_TempData/salmon_filtered.rds")
+
+expr <- bac %>%
+  dplyr::select(ORF, Sample, NumReads)
+
+cat("\nUnique Salmon transcripts:\n")
+print(n_distinct(expr$ORF))
+
+# ============================================================
+# 2. LOAD eggNOG ANNOTATION
+# ============================================================
+eggnog <- fread(
+  "PostKraken2/postkraken_eggnog.emapper.annotations",
+  comment.char = "#",
+  header = FALSE,
+  fill = TRUE,
+  sep = "\t"
+)
+
+
+colnames(eggnog) <- c(
+  "query","seed_ortholog","evalue","score","eggNOG_OGs",
+  "max_annot_lvl","COG_category","Description","Preferred_name",
+  "GOs","EC","KEGG_ko","KEGG_Pathway","KEGG_Module",
+  "KEGG_Reaction","KEGG_rclass","BRITE","KEGG_TC","CAZy",
+  "BiGG_Reaction","PFAMs"
+)
+
+cat("\nUnique eggNOG ORFs:\n")
+print(n_distinct(eggnog$query))
+
+# ============================================================
+# 3. CONVERT PRODIGAL ORF IDs -> PARENT TRANSCRIPT IDs
+# ============================================================
+# Example:
+# NODE_xxx_i0_1 -> NODE_xxx_i0
+# NODE_xxx_i0_2 -> NODE_xxx_i0
+
+eggnog <- eggnog %>%
+  mutate(
+    ORF = str_remove(query, "_[0-9]+$")
+  )
+
+# ============================================================
+# 4. KEEP ONLY TRANSCRIPTS PRESENT IN SALMON
+# ============================================================
+keep_orfs <- unique(expr$ORF)
+
+eggnog <- eggnog %>%
+  filter(ORF %in% keep_orfs)
+
+cat("\nAnnotated transcripts overlapping Salmon:\n")
+print(n_distinct(eggnog$ORF))
+
+# ============================================================
+# 5. CLEAN KEGG KO ANNOTATIONS
+# ============================================================
+eggnog_clean <- eggnog %>%
+  dplyr::select(ORF, KEGG_ko) %>%
+  filter(
+    !is.na(KEGG_ko),
+    KEGG_ko != "-"
+  ) %>%
+  mutate(
+    KEGG_ko = str_replace_all(KEGG_ko, "ko:", "")
+  )
+
+# split multiple KO assignments
+eggnog_long <- eggnog_clean %>%
+  separate_rows(KEGG_ko, sep = ",|;")
+
+cat("\nUnique KEGG KOs:\n")
+print(n_distinct(eggnog_long$KEGG_ko))
+
+# ============================================================
+# 6. MERGE EXPRESSION + FUNCTION
+# ============================================================
+expr_fun <- expr %>%
+  inner_join(
+    eggnog_long,
+    by = "ORF"
+  )
+
+cat("\nTranscripts after merge:\n")
+print(n_distinct(expr_fun$ORF))
+
+cat("\nRows after merge:\n")
+print(nrow(expr_fun))
+
+# ============================================================
+# 7. BUILD KO COUNT MATRIX
+# ============================================================
+# Transcript abundance is propagated to all ORFs/KOs
+# predicted on that transcript.
+
+kegg_long <- expr_fun %>%
+  group_by(Sample, KEGG_ko) %>%
+  summarise(
+    abundance = sum(NumReads, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nNumber of KEGG KOs in abundance table:\n")
+print(n_distinct(kegg_long$KEGG_ko))
+
+kegg_mat <- kegg_long %>%
+  pivot_wider(
+    names_from = Sample,
+    values_from = abundance,
+    values_fill = 0
+  )
+
+kegg_mat_df <- as.data.frame(kegg_mat)
+
+rownames(kegg_mat_df) <- kegg_mat_df$KEGG_ko
+kegg_mat_df$KEGG_ko <- NULL
+
+kegg_mat_df <- as.matrix(kegg_mat_df)
+
+# remove empty KOs
+kegg_mat_df <- kegg_mat_df[rowSums(kegg_mat_df) > 0, ]
+
+storage.mode(kegg_mat_df) <- "integer"
+
+cat("\nKO matrix dimensions:\n")
+print(dim(kegg_mat_df))
+
+# ============================================================
+# 8. SAMPLE METADATA
+# ============================================================
+# C samples = Reference
+# H samples = Elevated CO2
+
+metadata <- data.frame(
+  Site = ifelse(
+    grepl("^C", colnames(kegg_mat_df)),
+    "Reference",
+    "Elevated_CO2"
+  ),
+  row.names = colnames(kegg_mat_df)
+)
+
+metadata$Site <- factor(
+  metadata$Site,
+  levels = c("Reference", "Elevated_CO2")
+)
+
+cat("\nMetadata table:\n")
+print(table(metadata$Site))
+
+# ============================================================
+# 11. KEGG GSEA
+# ============================================================
+
+# Build ranked KO list
+geneList <- res_df %>%
+  filter(
+    !is.na(log2FoldChange)
+  ) %>%
+  distinct(KO, .keep_all = TRUE) %>%
+  arrange(desc(log2FoldChange)) %>%
+  dplyr::select(KO, log2FoldChange)
+
+geneList <- geneList$log2FoldChange
+names(geneList) <- res_df %>%
+  filter(
+    !is.na(log2FoldChange)
+  ) %>%
+  distinct(KO, .keep_all = TRUE) %>%
+  arrange(desc(log2FoldChange)) %>%
+  pull(KO)
+
+geneList <- sort(geneList, decreasing = TRUE)
+
+cat("\nKOs in ranked list:\n")
+print(length(geneList))
+
+# ------------------------------------------------------------
+# GSEA
+# ------------------------------------------------------------
+
+gsea_kegg <- gseKEGG(
+  geneList = geneList,
+  organism = "ko",
+  keyType = "kegg",
+  pAdjustMethod = "BH",
+  minGSSize = 5,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  verbose = FALSE, 
+  seed = 1234
+)
+
+# ------------------------------------------------------------
+# Results
+# ------------------------------------------------------------
+
+if (!is.null(gsea_kegg) &&
+    nrow(as.data.frame(gsea_kegg)) > 0) {
+
+  gsea_df <- as.data.frame(gsea_kegg)
+
+  print(
+    gsea_df %>%
+      dplyr::select(
+        ID,
+        Description,
+        NES,
+        p.adjust
+      ) %>%
+      arrange(p.adjust) %>%
+      head(20)
+  )
+
+  # Dotplot
+  clusterProfiler::dotplot(
+    gsea_kegg,
+    showCategory = 20
+  )
+
+  # Enrichment plot for top pathway
+  top_pathway <- gsea_df$ID[1]
+
+  gseaplot2(
+    gsea_kegg,
+    geneSetID = top_pathway,
+    title = gsea_df$Description[1]
+  )
+
+} else {
+
+  message(
+    "No significant KEGG pathways detected by GSEA."
+  )
+
+}
+
+# ============================================================
+# 12. Dot Plot
+# ============================================================
+
+library(patchwork)
+
+gsea_pos <- gsea_kegg
+gsea_pos@result <- gsea_pos@result %>%
+  filter(NES > 0) %>%
+  arrange(p.adjust)
+
+gsea_neg <- gsea_kegg
+gsea_neg@result <- gsea_neg@result %>%
+  filter(NES < 0) %>%
+  arrange(p.adjust)
+
+p1 <- clusterProfiler::dotplot(
+  gsea_pos,
+  showCategory = 20
+) +
+ggtitle("Enriched") +
+theme(
+  axis.text.y = element_text(size = 8)
+)
+
+p2 <-  clusterProfiler::dotplot(
+  gsea_neg,
+  showCategory = 20
+) +
+ggtitle("Suppressed") +
+theme(
+  axis.text.y = element_text(size = 8)
+)
+
+p1 + p2
+
+sum(res_df$padj < 0.05, na.rm = TRUE)
+
+View(plot_df)
+```
+
+```{r}
+# ============================================================
+# Filter KEGG results to bacterial-relevant pathways
+# ============================================================
+
+library(KEGGREST)
+library(stringr)
+library(dplyr)
+
+# Update pathway names from KEGG
+pathways <- keggList("pathway", "ko")
+
+pathway_tbl <- data.frame(
+  ID = sub("^path:", "", names(pathways)),
+  Description = unname(pathways),
+  stringsAsFactors = FALSE
+)
+
+gsea_kegg@result <- gsea_kegg@result %>%
+  left_join(pathway_tbl, by = "ID") %>%
+  mutate(
+    Description = coalesce(Description.y, Description.x)
+  ) %>%
+  dplyr::select(-Description.x, -Description.y)
+
+# ------------------------------------------------------------
+# Remove pathways that are not informative for bacteria
+# ------------------------------------------------------------
+
+remove_patterns <- c(
+
+  # Human disease
+  "disease",
+  "cancer",
+  "carcinogenesis",
+  "viral",
+  "bacterial infection",
+  "parasite",
+  "Huntington",
+  "Parkinson",
+  "Alzheimer",
+  "Amyotrophic",
+  "ALS",
+  "Prion",
+  "Glioma",
+  "Leukemia",
+  "Melanoma",
+  "Tuberculosis",
+  "COVID",
+  "Influenza",
+
+  # Organismal systems
+  "immune",
+  "endocrine",
+  "digestive",
+  "circulatory",
+  "nervous",
+  "reproductive",
+  "development",
+  "longevity",
+
+  # Animal signalling
+  "MAPK",
+  "ErbB",
+  "Wnt",
+  "Notch",
+  "Hippo",
+  "TGF-beta",
+  "VEGF",
+  "mTOR",
+  "PI3K",
+  "Ras",
+  "Rap1",
+  "cAMP",
+  "cGMP",
+  "Calcium signaling",
+
+  # Animal physiology
+  "synapse",
+  "axon",
+  "dopaminergic",
+  "serotonergic",
+  "cholinergic",
+  "glutamatergic",
+  "GABAergic",
+  "insulin",
+  "thyroid",
+  "estrogen",
+  "progesterone",
+  "GnRH",
+  "oxytocin",
+  "cardiac",
+  "adrenergic",
+  "platelet",
+  "Fc gamma",
+  "HIF-1",
+  "apoptosis",
+  "autophagy",
+  "endocytosis",
+  "phagosome"
+)
+
+gsea_kegg@result <- gsea_kegg@result %>%
+  filter(
+    !str_detect(
+      Description,
+      regex(
+        paste(remove_patterns, collapse = "|"),
+        ignore_case = TRUE
+      )
+    )
+  )
+
+# ============================================================
+# Split into enriched and suppressed pathways
+# ============================================================
+
+gsea_pos <- gsea_kegg
+gsea_pos@result <- gsea_pos@result %>%
+  filter(NES > 0) %>%
+  arrange(p.adjust)
+
+gsea_neg <- gsea_kegg
+gsea_neg@result <- gsea_neg@result %>%
+  filter(NES < 0) %>%
+  arrange(p.adjust)
+
+# ============================================================
+# Plot
+# ============================================================
+
+library(patchwork)
+
+p1 <- clusterProfiler::dotplot(
+  gsea_pos,
+  showCategory = 20
+) +
+  ggtitle("Enriched") +
+  theme(axis.text.y = element_text(size = 8))
+
+p2 <- clusterProfiler::dotplot(
+  gsea_neg,
+  showCategory = 20
+) +
+  ggtitle("Suppressed") +
+  theme(axis.text.y = element_text(size = 8))
+
+p1 + p2
+```
+
+# NES barplot
+```{r}
+# ============================================================
+# Combined GSEA bar plot
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+gsea_df <- as.data.frame(gsea_kegg)
+
+plot_df <- bind_rows(
+
+  gsea_df %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = 15) %>%
+    mutate(direction = "Elevated CO2"),
+
+  gsea_df %>%
+    filter(NES < 0) %>%
+    arrange(NES) %>%
+    slice_head(n = 15) %>%
+    mutate(direction = "Reference")
+
+) %>%
+  mutate(
+    neglog10_p = -log10(p.adjust),
+    Description = forcats::fct_reorder(Description, NES)
+  )
+
+KEGG_combined_bar_plot <- ggplot(
+  plot_df,
+  aes(
+    x = NES,
+    y = Description,
+    fill = direction,
+    alpha = neglog10_p
+  )
+) +
+  geom_col(
+    width = 0.6,
+    colour = "black",
+    linewidth = 0.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Reference" = "#2C728E",
+      "Elevated CO2" = "#D4476C"
+    ),
+    name = "Enrichment"
+  ) +
+  scale_alpha_continuous(
+    range = c(0.35, 1),
+    name = expression(-log[10]~adjusted~italic(p)~value)
+  ) +
+  labs(
+    x = "Normalized Enrichment Score (NES)",
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(
+      colour = "black",
+      linewidth = 1,
+      fill = NA
+    ),
+    legend.position = "right",
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 12),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10)
+  )
+
+KEGG_combined_bar_plot
+
+ggsave(
+  filename = "PostKraken2/Figures/KEGG_GSEA_NES_combined_filtered.svg",
+  plot = KEGG_combined_bar_plot,
+  width = 8.5,
+  height = 4.5
+)
+```
+
+
+
+
+
+
+
+
