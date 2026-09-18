@@ -1,0 +1,48 @@
+SampleID,ID,SampleType,Condition
+Bacterial_Standard_S36_R1_001.fastq.gz,Bacterial Standard,Bacterial Standard,NA
+Extraction_Blank1_S33_R1_001.fastq.gz,Extr_Blank1,Extr_Blank,NA
+Extraction_Blank2_S34_R1_001.fastq.gz,Extr_Blank2,Extr_Blank,NA
+Extraction_Blank3_S35_R1_001.fastq.gz,Extr_Blank3,Extr_Blank,NA
+Extraction_Blank4_S68_R1_001.fastq.gz,Extr_Blank4,Extr_Blank,NA
+Extraction_Blank5_S46_R1_001.fastq.gz,Extr_Blank5,Extr_Blank,NA
+Extraction_Blank6_S58_R1_001.fastq.gz,Extr_Blank6,Extr_Blank,NA
+Filter_PBS_H2O_S69_R1_001.fastq.gz,PBS,PBS,NA
+Shikine_Blank_H2O_S37_R1_001.fastq.gz,Blank,Blank,NA
+Shikine_C1_S1_R1_001.fastq.gz,C1,Sample,Reference
+Shikine_C10_S10_R1_001.fastq.gz,C10,Sample,Reference
+Shikine_C11_S11_R1_001.fastq.gz,C11,Sample,Reference
+Shikine_C12_S12_R1_001.fastq.gz,C12,Sample,Reference
+Shikine_C13_S13_R1_001.fastq.gz,C13,Sample,Reference
+Shikine_C14_S14_R1_001.fastq.gz,C14,Sample,Reference
+Shikine_C15_S15_R1_001.fastq.gz,C15,Sample,Reference
+Shikine_C16_S16_R1_001.fastq.gz,C16,Sample,Reference
+Shikine_C2_S2_R1_001.fastq.gz,C2,Sample,Reference
+Shikine_C3_S3_R1_001.fastq.gz,C3,Sample,Reference
+Shikine_C4_S4_R1_001.fastq.gz,C4,Sample,Reference
+Shikine_C5_S5_R1_001.fastq.gz,C5,Sample,Reference
+Shikine_C6_S6_R1_001.fastq.gz,C6,Sample,Reference
+Shikine_C7_S7_R1_001.fastq.gz,C7,Sample,Reference
+Shikine_C8_S8_R1_001.fastq.gz,C8,Sample,Reference
+Shikine_C9_S9_R1_001.fastq.gz,C9,Sample,Reference
+Shikine_H1_S17_R1_001.fastq.gz,H1,Sample,Elevated CO2
+Shikine_H10_S26_R1_001.fastq.gz,H10,Sample,Elevated CO2
+Shikine_H11_S27_R1_001.fastq.gz,H11,Sample,Elevated CO2
+Shikine_H12_S28_R1_001.fastq.gz,H12,Sample,Elevated CO2
+Shikine_H13_S29_R1_001.fastq.gz,H13,Sample,Elevated CO2
+Shikine_H14_S30_R1_001.fastq.gz,H14,Sample,Elevated CO2
+Shikine_H15_S31_R1_001.fastq.gz,H15,Sample,Elevated CO2
+Shikine_H16_S32_R1_001.fastq.gz,H16,Sample,Elevated CO2
+Shikine_H2_S18_R1_001.fastq.gz,H2,Sample,Elevated CO2
+Shikine_H2O_C1_S49_R1_001.fastq.gz,C_H2O_1,H2O,Reference
+Shikine_H2O_C2_S50_R1_001.fastq.gz,C_H2O_2,H2O,Reference
+Shikine_H2O_C3_S51_R1_001.fastq.gz,C_H2O_3,H2O,Reference
+Shikine_H2O_H1_S52_R1_001.fastq.gz,H_H2O_1,H2O,Elevated CO2
+Shikine_H2O_H2_S53_R1_001.fastq.gz,H_H2O_2,H2O,Elevated CO2
+Shikine_H2O_H3_S54_R1_001.fastq.gz,H_H2O_3,H2O,Elevated CO2
+Shikine_H3_S19_R1_001.fastq.gz,H3,Sample,Elevated CO2
+Shikine_H4_S20_R1_001.fastq.gz,H4,Sample,Elevated CO2
+Shikine_H5_S21_R1_001.fastq.gz,H5,Sample,Elevated CO2
+Shikine_H6_S22_R1_001.fastq.gz,H6,Sample,Elevated CO2
+Shikine_H7_S23_R1_001.fastq.gz,H7,Sample,Elevated CO2
+Shikine_H8_S24_R1_001.fastq.gz,H8,Sample,Elevated CO2
+Shikine_H9_S25_R1_001.fastq.gz,H9,Sample,Elevated CO2
