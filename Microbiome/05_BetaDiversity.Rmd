@@ -1,0 +1,1897 @@
+---
+title: "Roger_assignments"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(compositions) # Centered Log Ratio Plot
+set.seed(123)
+```
+
+
+```{r}
+ps_noPNA_nPl <- readRDS(file = "/Users/callumjameshudson/Desktop/Urchin Microbiome/Shikine Urchin Microbiome/ps_noPNA_nPL.rds")
+
+ps_shikine <- prune_samples(
+  sample_data(ps_noPNA_nPl)$Saibai != "Saibai" &
+  !sample_data(ps_noPNA_nPl)$Type %in% c("Standard", "Blank") &
+    sample_data(ps_noPNA_nPl)$Treatment !="V" &
+  sample_data(ps_noPNA_nPl)$Location != "Shimoda",
+  ps_noPNA_nPl
+)
+
+sample_data(ps_shikine)
+```
+
+```{r}
+# Remove samples (Blanks, +ve controls etc.)
+ps_shikine_tissue <- subset_samples(ps_shikine, 
+                                    Type2 == "Tissue" & 
+                                    sample_names(ps_shikine) != "Shikine_Blank_H2O_S37_R1_001.fastq.gz")
+
+sample_data(ps_shikine_tissue)
+
+view(tax_table(ps_shikine_tissue))
+
+otu_df <- as.data.frame(otu_table(ps_shikine_tissue))
+
+# Remove the column names (i.e., ASV numbers)
+colnames(otu_df) <- NULL
+
+# Rename rownames to 1 through 32
+rownames(otu_df) <- 1:32
+
+# Export to CSV
+write.csv(otu_df, "Y.csv")
+
+sample_data(ps_shikine_tissue)$Treatment <- factor(
+  recode(sample_data(ps_shikine_tissue)$Treatment,
+         "Control" = "Reference",
+         "High" = "Elevated CO2"),
+  levels = c("Reference", "Elevated CO2")
+)
+
+
+saveRDS(ps_shikine_tissue, "/Users/callumjameshudson/Desktop/Urchin Microbiome/Shikine Urchin Microbiome/02_Temp_Data/ps_shikine_tissue.rds")
+
+ps_shikine_tissue <- readRDS(file = "/Users/callumjameshudson/Desktop/Urchin Microbiome/Shikine Urchin Microbiome/02_Temp_Data/ps_shikine_tissue.rds")
+
+
+### ADD phylogenetic tree
+GTR.fit <- readRDS(file = "/Users/callumjameshudson/Desktop/Urchin Microbiome/Shikine Urchin Microbiome/02_Temp_Data/fitGTR5.rds")
+
+library(phyloseq)
+library(phangorn)
+
+# Check the structure of the tree
+is(GTR.fit$tree, "phylo")  # should return TRUE
+
+# Add the tree to your phyloseq object
+ps_shikine_tissue <- merge_phyloseq(ps_shikine_tissue, phy_tree(GTR.fit$tree))
+
+ps_shikine_tissue 
+ps_plot <- subset_samples(ps_shikine_tissue, !(SampleID %in% c("Shikine_C11_S11", "Shikine_C16_S16", "Shikine_H3_S19")))
+
+```
+
+# Extract Taxa Table for MIMIX
+```{r}
+# Extract taxonomy matrix
+tax_mat <- as.matrix(tax_table(ps_gut))
+
+print(dim(tax_mat))
+print(head(tax_mat))
+
+# Define rank prefixes, assuming standard ranks in order:
+rank_prefixes <- c("k__", "p__", "c__", "o__", "f__", "g__", "s__")
+
+# Make sure number of ranks matches number of columns
+if(length(rank_prefixes) != ncol(tax_mat)) {
+  stop("Number of rank prefixes does not match number of taxonomy columns!")
+}
+
+# Add prefixes column-wise with a loop
+tax_mat_prefixed <- matrix(nrow = nrow(tax_mat), ncol = ncol(tax_mat))
+for (i in seq_len(ncol(tax_mat))) {
+  tax_mat_prefixed[, i] <- ifelse(
+    grepl("^\\w+__", tax_mat[, i]),  # if prefix already there, keep as is
+    tax_mat[, i],
+    paste0(rank_prefixes[i], tax_mat[, i])
+  )
+}
+
+rownames(tax_mat_prefixed) <- rownames(tax_mat)
+colnames(tax_mat_prefixed) <- colnames(tax_mat)
+
+# Combine each row into a semicolon-separated string
+taxa_strings <- apply(tax_mat_prefixed, 1, function(x) paste(x, collapse = "; "))
+
+# Make data frame for export
+taxa_df <- data.frame(
+  taxon_id = rownames(tax_mat),
+  taxonomy = taxa_strings,
+  stringsAsFactors = FALSE
+)
+
+head(taxa_df)
+
+write.csv(taxa_df, "taxa.csv", row.names = FALSE, quote = FALSE)
+```
+
+
+# Load required packages.
+```{r, warning=F, message=F, results='hide'}
+sapply(c("phyloseq", "ggplot2", "vegan", "pairwiseAdonis"), require, character.only = TRUE)
+```
+
+```{r}
+level_order1 <- c('Reference', 'Elevated CO2')
+disp.pal1 <- c("#2C728E", "#D4476C")
+names(disp.pal1) <- level_order1
+```
+
+```{r}
+# Quick nmds
+ps.norm.tissue <- transform_sample_counts(ps_gut_clean, function(x) x / sum(x))
+
+# Ordination
+GP.ord <- ordinate(ps.norm.tissue, method = "NMDS", distance = "bray")
+
+# Plot
+nMDS <- plot_ordination(ps.norm.tissue, GP.ord, type = "samples", color = "Condition") +
+  scale_color_manual(values = disp.pal1)
+
+nMDS
+```
+```{r}
+tree <- phy_tree(ps_gut)
+
+tree_rooted <- midpoint(tree)
+
+phy_tree(ps_gut) <- tree_rooted
+```
+
+
+# Stats for all metrics 
+```{r}
+##### BRAY Distance #####
+bray_bacteria <- phyloseq::distance(ps_gut, method = "bray")
+
+# make a data frame from the sample_data
+bacteria.taxa.df <-  data.frame(sample_data(ps_gut)) 
+
+# Beta dispersion test
+permutest(betadisper(bray_bacteria, bacteria.taxa.df$Condition))
+### multivariate homogeneity of group dispersion OKAY ###
+# p = 0.133
+
+# ## PERMANOVA Adonis test
+adonis2(formula = bray_bacteria ~ Condition, data = bacteria.taxa.df)
+# F = 7.09, p = 0.001 ***
+
+##### Weighted UniFrac #####
+# Calculate weighted UniFrac distance matrix
+wunifrac_dist <- phyloseq::distance(ps_gut, method = "wunifrac")
+
+# Create sample data frame
+bacteria.taxa.df <- data.frame(sample_data(ps_gut))
+
+# 3. Check homogeneity of dispersion
+wunifrac_betadisper <- betadisper(wunifrac_dist, bacteria.taxa.df$Condition)
+permutest(wunifrac_betadisper)
+# p = 0.976 - proceed to PERMANOVA
+
+# 4. Run PERMANOVA
+adonis2(formula = wunifrac_dist ~ Condition, data = bacteria.taxa.df)
+# F = 9.01, p < 0.001 ***
+
+##### Unweighted UniFrac #####
+#  Calculate unweighted UniFrac distance matrix
+unifrac_dist <- phyloseq::distance(ps_gut, method = "unifrac")
+
+#  Create sample data frame
+bacteria.taxa.df <- data.frame(sample_data(ps_gut))
+
+#  Check homogeneity of dispersion
+unifrac_betadisper <- betadisper(unifrac_dist, bacteria.taxa.df$Condition)
+permutest(unifrac_betadisper)
+# p = 0.486 - proceed to PERMANOVA
+
+# 4. Run PERMANOVA
+adonis2(formula = unifrac_dist ~ Condition, data = bacteria.taxa.df)
+# F = 2.90, p < 0.001 ***
+
+##### CLR #####
+
+clr_transform <- function(x){
+  x <- x + 1                # pseudocount
+  clr(x)
+}
+
+# CLR transformed OTU table
+ps_clr <- transform_sample_counts(ps_gut, clr_transform)
+
+# Euclidean distance (required for CLR)
+clr_dist <- phyloseq::distance(ps_clr, method = "euclidean")
+
+# PERMANOVA
+adonis_clr <- adonis2(
+  clr_dist ~ Condition,
+  data = data.frame(sample_data(ps_clr)),
+  permutations = 999
+)
+
+adonis_clr
+# F = 6.20, p = 0.001 ***
+
+# Beta dispersion test
+clr_bd <- betadisper(
+  clr_dist,
+  sample_data(ps_clr)$Condition
+)
+
+permutest(clr_bd)
+#p = 0.874
+
+##### PhilR #####
+adonis_philr <- adonis2(
+  philr_dist ~ Condition,
+  data = data.frame(sample_data(ps_gut)),
+  permutations = 999
+)
+
+adonis_philr
+# F = 16.77, p < 0.001 ***
+
+# Beta dispersion test
+philr_bd <- betadisper(
+  philr_dist,
+  sample_data(ps_plot)$Condition
+)
+
+permutest(philr_bd)
+# p = 0.107
+
+##### CLR - Water vs Gut by Site #####
+adonis_clr_all <- adonis2(
+  clr_dist_all ~ SampleType + Condition,
+  data = meta_all,
+  permutations = 999,
+  by = "margin"
+)
+
+adonis_clr_all
+#           Df SumOfSqs      R2      F Pr(>F)    
+#SampleType  1    35140 0.18968 9.1814  0.001 ***
+#Condition   1    23998 0.12954 6.2702  0.001 ***
+#Residual   33   126300 0.68176                  
+#Total      35   185255 1.00000  
+
+# -------------------------
+# Stats: do water sample communities differ?
+# -------------------------
+
+ps_water <- subset_samples(
+  ps_shikine,
+  SampleType == "H2O"
+)
+
+# Remove taxa absent from all water samples
+ps_water <- prune_taxa(
+  taxa_sums(ps_water) > 0,
+  ps_water
+)
+
+# CLR transformation
+ps_water_clr <- transform_sample_counts(
+  ps_water,
+  clr_transform
+)
+
+# Euclidean distance
+water_dist <- phyloseq::distance(
+  ps_water_clr,
+  method = "euclidean"
+)
+
+# Metadata
+water_meta <- data.frame(
+  sample_data(ps_water_clr)
+)
+
+# Condition is already correctly coded
+water_meta$Condition <- factor(
+  water_meta$Condition,
+  levels = c("Reference", "Elevated CO2")
+)
+
+# PERMANOVA
+adonis2(
+  water_dist ~ Condition,
+  data = water_meta,
+  permutations = 999
+)
+
+#         Df SumOfSqs      R2      F Pr(>F)
+#Model     1   3817.5 0.21647 1.1051    0.2
+#Residual  4  13817.3 0.78353              
+#Total     5  17634.8 1.00000 
+
+# Water samples between sites didn't significantly differ.
+```
+
+
+
+### Bray Curtis
+```{r}
+# Ordinate using Bray-Curtis on relative abundance
+GP.ord <- ordinate(
+  transform_sample_counts(ps_gut, function(x) x / sum(x)),
+  method = "NMDS",
+  distance = "bray"
+)
+
+# Extract NMDS stress
+stress_val <- round(GP.ord$stress, 3)
+stress_label <- paste0("Stress = ", stress_val)
+
+
+# F = 7.09, p = 0.001 ***
+adonis_label <- expression(italic(F) == 7.09 * "," ~ italic(p) < 0.001 ~ "***")
+
+# Extract NMDS site scores for ellipses
+mds.scores <- as.data.frame(scores(GP.ord, display = "sites"))
+mds.scores$Condition <- factor(
+  sample_data(ps_gut)$Condition,
+  levels = c("Reference", "Elevated CO2")
+)
+
+# Ellipse function
+veganCovEllipse <- function(cov, center = c(0,0), scale = 1, npoints = 100){
+  theta <- (0:npoints) * 2 * pi / npoints
+  Circle <- cbind(cos(theta), sin(theta))
+  t(center + scale * t(Circle %*% chol(cov)))
+}
+
+# Generate ellipse data
+df_ellipse <- do.call(rbind, lapply(levels(mds.scores$Condition), function(g){
+  group_data <- mds.scores[mds.scores$Condition == g, ]
+  cov_data <- cov.wt(cbind(group_data$NMDS1, group_data$NMDS2),
+                     wt = rep(1 / nrow(group_data), nrow(group_data)))$cov
+  center <- c(mean(group_data$NMDS1), mean(group_data$NMDS2))
+  ellipse_coords <- veganCovEllipse(cov_data, center)
+  data.frame(NMDS1 = ellipse_coords[,1],
+             NMDS2 = ellipse_coords[,2],
+             Condition = g)
+}))
+
+# Named color palette
+disp.pal1 <- c("Reference" = "#2C728E", "Elevated CO2" = "#D4476C")
+
+# --- NMDS plot ---
+Bray_nMDS <- plot_ordination(
+  ps_gut, GP.ord, type = "samples", color = "Condition"
+) +
+  geom_path(
+    data = df_ellipse,
+    aes(x = NMDS1, y = NMDS2, group = Condition, colour = Condition),
+    size = 0.8
+  ) +
+  scale_color_manual(values = disp.pal1) +
+  labs(color = "Site") +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(color = "black")
+  ) +
+  annotate("text", x = Inf, y = Inf, label = stress_label,
+           hjust = 1.05, vjust = 2.8, size = 4) +
+  annotate("text", x = Inf, y = Inf, label = adonis_label,
+           hjust = 1.05, vjust = 1.25, size = 4, parse = TRUE)
+
+Bray_nMDS
+
+# Save
+ggsave("Figures_Alpha_Beta_div/BrayCurtis_NMDS.png", Bray_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+ggsave("Figures_Alpha_Beta_div/BrayCurtis_NMDS.svg", Bray_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+```
+
+### Weighted UniFrac
+```{r}
+# -----------------------------
+# --- Weighted UniFrac NMDS ---
+# -----------------------------
+# Use Condition directly
+w_unifrac_treatment <- factor(sample_data(ps_gut)$Condition,
+                              levels = c("Reference", "Elevated CO2"))
+
+# NMDS ordination
+GP.ord.w.unifrac <- ordinate(
+  transform_sample_counts(ps_gut, function(x) x / sum(x)),
+  method = "NMDS",
+  distance = "wunifrac"
+)
+
+# Stress
+stress_val <- round(GP.ord.w.unifrac$stress, 3)
+stress_label <- paste0("Stress = ", stress_val)
+
+# F = 8.94, p = 0.002 **
+adonis_label <- expression(italic(F) == 9.01 * "," ~ italic(p) < 0.001 ~ "***")
+
+# NMDS scores
+w_unifrac_scores <- as.data.frame(scores(GP.ord.w.unifrac, display = "sites"))
+w_unifrac_scores$Condition <- w_unifrac_treatment
+
+length(w_unifrac_treatment)
+w_unifrac_treatment
+
+# Ellipse function
+veganCovEllipse <- function(cov, center = c(0,0), scale = 1, npoints = 100){
+  theta <- (0:npoints) * 2 * pi / npoints
+  Circle <- cbind(cos(theta), sin(theta))
+  t(center + scale * t(Circle %*% chol(cov)))
+}
+
+# Generate ellipse data
+df_ellipse_w <- do.call(rbind, lapply(levels(w_unifrac_scores$Condition), function(g){
+  group_data <- w_unifrac_scores[w_unifrac_scores$Condition == g, ]
+  cov_data <- cov.wt(cbind(group_data$NMDS1, group_data$NMDS2),
+                     wt = rep(1 / nrow(group_data), nrow(group_data)))$cov
+  center <- c(mean(group_data$NMDS1), mean(group_data$NMDS2))
+  ellipse_coords <- veganCovEllipse(cov_data, center)
+  data.frame(NMDS1 = ellipse_coords[,1],
+             NMDS2 = ellipse_coords[,2],
+             Condition = g)
+}))
+
+# Plot
+w_unifrac_nMDS <- plot_ordination(
+  ps_plot, GP.ord.w.unifrac, type = "samples", color = "Condition"
+) +
+  geom_path(data = df_ellipse_w, aes(x = NMDS1, y = NMDS2, colour = Condition, group = Condition), size = 0.8) +
+  scale_color_manual(values = disp.pal1) +
+  labs(color = "Condition") +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(color = "black")
+  ) +
+  annotate("text", x = Inf, y = Inf, label = stress_label,
+           hjust = 1.05, vjust = 2.8, size = 4) +
+  annotate("text", x = Inf, y = Inf, label = adonis_label,
+           hjust = 1.05, vjust = 1.25, size = 4, parse = TRUE)
+
+w_unifrac_nMDS
+
+# Save
+ggsave("Figures_Alpha_Beta_div/W_Unifrac_NMDS.png", w_unifrac_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+ggsave("Figures_Alpha_Beta_div/W_Unifrac_NMDS.svg", w_unifrac_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+
+```
+
+# Unweighted Unifrac
+```{r}
+# -----------------------------
+# --- Unweighted UniFrac NMDS ---
+# -----------------------------
+unifrac_treatment <- factor(sample_data(ps_plot)$Condition,
+                            levels = c("Reference", "Elevated CO2"))
+
+GP.ord.unifrac <- ordinate(
+  transform_sample_counts(ps_gut, function(x) x / sum(x)),
+  method = "NMDS",
+  distance = "unifrac"
+)
+
+stress_val <- round(GP.ord.unifrac$stress, 3)
+stress_label <- paste0("Stress = ", stress_val)
+
+# F = 2.90, p < 0.001 ***
+adonis_label <- expression(italic(F) == 2.90 * "," ~ italic(p) < 0.001 ~ "***")
+
+unifrac_scores <- as.data.frame(scores(GP.ord.unifrac, display = "sites"))
+unifrac_scores$Condition <- unifrac_treatment
+
+df_ellipse_u <- do.call(rbind, lapply(levels(unifrac_scores$Condition), function(g){
+  group_data <- unifrac_scores[unifrac_scores$Condition == g, ]
+  cov_data <- cov.wt(cbind(group_data$NMDS1, group_data$NMDS2),
+                     wt = rep(1 / nrow(group_data), nrow(group_data)))$cov
+  center <- c(mean(group_data$NMDS1), mean(group_data$NMDS2))
+  ellipse_coords <- veganCovEllipse(cov_data, center)
+  data.frame(NMDS1 = ellipse_coords[,1],
+             NMDS2 = ellipse_coords[,2],
+             Condition = g)
+}))
+
+UW_unifrac_nMDS <- plot_ordination(
+  ps_plot, GP.ord.unifrac, type = "samples", color = "Condition"
+) +
+  geom_path(data = df_ellipse_u, aes(x = NMDS1, y = NMDS2, colour = Condition, group = Condition), size = 0.8) +
+  scale_color_manual(values = disp.pal1) +
+  labs(color = "Condition") +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(color = "black")
+  ) +
+  annotate("text", x = Inf, y = Inf, label = stress_label,
+           hjust = 1.05, vjust = 2.8, size = 4) +
+  annotate("text", x = Inf, y = Inf, label = adonis_label,
+           hjust = 1.05, vjust = 1.25, size = 4, parse = TRUE)
+
+UW_unifrac_nMDS
+
+# Save
+ggsave("Figures_Alpha_Beta_div/UW_Unifrac_NMDS.png", UW_unifrac_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+ggsave("Figures_Alpha_Beta_div/UW_Unifrac_NMDS.svg", UW_unifrac_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+```
+
+# Centered Log Ratio
+```{r}
+clr_transform <- function(x){
+  x <- x + 1                # pseudocount
+  clr(x)
+}
+
+# Ordinate
+GP.ord.clr <- ordinate(
+  transform_sample_counts(ps_gut, clr_transform),
+  method = "NMDS",
+  distance = "euclidean"
+)
+
+stress_val <- round(GP.ord.clr$stress, 3)
+stress_label <- paste0("Stress = ", stress_val)
+
+# CLR transformed OTU table
+ps_clr <- transform_sample_counts(ps_gut, clr_transform)
+
+# Euclidean distance (required for CLR)
+clr_dist <- phyloseq::distance(ps_clr, method = "euclidean")
+
+# PERMANOVA
+adonis_clr <- adonis2(
+  clr_dist ~ Condition,
+  data = data.frame(sample_data(ps_clr)),
+  permutations = 9999
+)
+
+adonis_clr
+
+adonis_label <- expression(italic(F) == 6.20 * "," ~ italic(p) < 0.001 ~ "***")
+
+
+clr_scores <- as.data.frame(scores(GP.ord.clr, display = "sites"))
+clr_scores$Condition <- factor(sample_data(ps_gut)$Condition,
+                               levels = c("Reference", "Elevated CO2"))
+
+df_ellipse_clr <- do.call(rbind, lapply(levels(clr_scores$Condition), function(g){
+
+  group_data <- clr_scores[clr_scores$Condition == g, ]
+
+  cov_data <- cov.wt(
+    cbind(group_data$NMDS1, group_data$NMDS2),
+    wt = rep(1 / nrow(group_data), nrow(group_data))
+  )$cov
+
+  center <- c(mean(group_data$NMDS1), mean(group_data$NMDS2))
+  ellipse_coords <- veganCovEllipse(cov_data, center)
+
+  data.frame(NMDS1 = ellipse_coords[,1],
+             NMDS2 = ellipse_coords[,2],
+             Condition = g)
+}))
+
+clr_nMDS <- plot_ordination(
+  ps_gut, GP.ord.clr,
+  type = "samples",
+  color = "Condition"
+) +
+  geom_path(data = df_ellipse_clr,
+            aes(x = NMDS1, y = NMDS2, colour = Condition, group = Condition),
+            size = 0.8) +
+ scale_color_manual(values = c("Elevated CO2" = "#D4476C",
+                              "Reference"    = "#2C728E")) +
+  labs(color = "Condition") +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(color = "black")
+  ) +
+  annotate("text", x = Inf, y = Inf, label = stress_label,
+           hjust = 1.05, vjust = 2.8, size = 4) +
+  annotate("text", x = Inf, y = Inf, label = adonis_label,
+           hjust = 1.05, vjust = 1.25, size = 4, parse = TRUE)
+
+clr_nMDS
+
+# Save
+ggsave("Figures_Alpha_Beta_div/CLR_NMDS.png", clr_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+ggsave("Figures_Alpha_Beta_div/CLR_NMDS.svg", clr_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+
+```
+
+# Include water 
+```{r}
+library(compositions)
+library(vegan)
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+
+# -------------------------
+# Combine gut + water
+# -------------------------
+
+otu_all <- merge_phyloseq(
+  otu_table(ps_gut),
+  otu_table(ps_water)
+)
+
+# Taxonomy
+tax_all <- tax_table(ps)[taxa_names(otu_all), ]
+
+# -------------------------
+# Metadata
+# -------------------------
+
+meta_gut <- data.frame(sample_data(ps_gut))
+meta_water <- data.frame(sample_data(ps_water))
+
+meta_all <- rbind(meta_gut, meta_water)
+
+# Reorder metadata to exactly match OTU table
+meta_all <- meta_all[match(sample_names(otu_all), rownames(meta_all)), , drop = FALSE]
+
+# Check
+all(rownames(meta_all) == sample_names(otu_all))
+
+# Make phyloseq object WITHOUT a tree
+ps_shikine <- phyloseq(
+  otu_all,
+  tax_all,
+  sample_data(meta_all)
+)
+
+# Remove ASVs occurring in fewer than 2 samples
+ps_shikine <- filter_taxa(
+  ps_shikine,
+  function(x) sum(x > 0) >= 2,
+  prune = TRUE
+)
+
+# -------------------------
+# CLR transform
+# -------------------------
+
+clr_transform <- function(x){
+  x <- x + 1
+  clr(x)
+}
+
+ps_clr_all <- transform_sample_counts(
+  ps_shikine,
+  clr_transform
+)
+
+# -------------------------
+# NMDS (gut + water)
+# -------------------------
+
+GP.ord.clr_all <- ordinate(
+  ps_clr_all,
+  method = "NMDS",
+  distance = "euclidean"
+)
+
+stress_val_all <- round(GP.ord.clr_all$stress, 3)
+stress_label_all <- paste0("Stress = ", stress_val_all)
+
+# -------------------------
+# Euclidean distance
+# -------------------------
+
+clr_dist_all <- phyloseq::distance(
+  ps_clr_all,
+  method = "euclidean"
+)
+
+# -------------------------
+# Metadata
+# -------------------------
+
+meta_all <- data.frame(
+  sample_data(ps_clr_all)
+)
+
+# Make sure SampleType is a factor
+meta_all$SampleType <- factor(
+  meta_all$SampleType,
+  levels = c("Sample", "H2O"),
+  labels = c("Tissue", "Water")
+)
+
+# Condition
+meta_all$Condition <- factor(
+  meta_all$Condition,
+  levels = c("Reference", "Elevated CO2")
+)
+
+#-------------------------
+# PERMANOVA
+#-------------------------
+
+adonis_clr_all <- adonis2(
+  clr_dist_all ~ SampleType + Condition,
+  data = meta_all,
+  permutations = 999,
+  by = "margin"
+)
+
+adonis_clr_all
+
+#            Df SumOfSqs      R2      F Pr(>F)    
+#SampleType  1    35140 0.18968 9.1814  0.001 ***
+#Condition   1    23998 0.12954 6.2702  0.001 ***
+
+#-------------------------
+# NMDS scores
+#-------------------------
+
+clr_scores_all <- as.data.frame(
+  scores(GP.ord.clr_all, display = "sites")
+)
+
+clr_scores_all$Condition <- meta_all$Condition
+clr_scores_all$SampleType <- meta_all$SampleType
+
+# Group = Condition × SampleType
+clr_scores_all$Group <- interaction(
+  clr_scores_all$Condition,
+  clr_scores_all$SampleType,
+  sep = "_"
+)
+
+#-------------------------
+# Ellipses
+#-------------------------
+
+df_ellipse_clr_all <- do.call(
+  rbind,
+  lapply(levels(clr_scores_all$Group), function(g){
+
+    group_data <- clr_scores_all[
+      clr_scores_all$Group == g,
+    ]
+
+    cov_data <- cov.wt(
+      cbind(group_data$NMDS1,
+            group_data$NMDS2),
+      wt = rep(1 / nrow(group_data),
+               nrow(group_data))
+    )$cov
+
+    center <- c(
+      mean(group_data$NMDS1),
+      mean(group_data$NMDS2)
+    )
+
+    ellipse_coords <- veganCovEllipse(
+      cov_data,
+      center
+    )
+
+    data.frame(
+      NMDS1 = ellipse_coords[,1],
+      NMDS2 = ellipse_coords[,2],
+      Group = g,
+      Condition = unique(group_data$Condition),
+      SampleType = unique(group_data$SampleType)
+    )
+  })
+)
+
+#-------------------------
+# Plot
+#-------------------------
+
+clr_nMDS_all <- ggplot(
+  clr_scores_all,
+  aes(
+    NMDS1,
+    NMDS2,
+    colour = Condition,
+    shape = SampleType
+  )
+) +
+
+  geom_path(
+    data = df_ellipse_clr_all,
+    aes(
+      x = NMDS1,
+      y = NMDS2,
+      group = Group,
+      colour = Condition
+    ),
+    linewidth = 0.8,
+    inherit.aes = FALSE
+  ) +
+
+  geom_point(size = 1.5) +
+
+  scale_color_manual(
+    values = c(
+      "Reference" = "#2C728E",
+      "Elevated CO2" = "#D4476C"
+    ),
+    labels = c(
+      "Reference",
+      expression("Elevated CO"[2])
+    )
+  ) +
+
+  scale_shape_manual(
+    values = c(
+      Tissue = 16,
+      Water = 17
+    )
+  ) +
+
+  labs(
+    colour = "Site",
+    shape = "Sample Type"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.border = element_rect(
+      fill = NA,
+      color = "black",
+      linewidth = 1
+    ),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(color = "black")
+  ) +
+
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = stress_label_all,
+    hjust = 1.05,
+    vjust = 4,
+    size = 4.1
+  ) +
+
+  annotate(
+  "text",
+  x = Inf,
+  y = Inf,
+  label = "'Type:'~~italic(F)==9.18*','~~italic(p)<0.001~'***'",
+  hjust = 1.05,
+  vjust = 1.25,
+  size = 4,
+  parse = TRUE
+) +
+
+annotate(
+  "text",
+  x = Inf,
+  y = Inf,
+  label = "'Site:'~~italic(F)==6.27*','~~italic(p)<0.001~'***'",
+  hjust = 1.05,
+  vjust = 2.3,
+  size = 4,
+  parse = TRUE
+)
+
+clr_nMDS_all
+
+ggsave(
+  filename = "Figures_Alpha_Beta_div/Tissue_and_Water_NMDS.svg",
+  plot = clr_nMDS_all,
+  width = 7,
+  height = 4,
+  device = "svg"
+)
+
+#Amplicon sequence variants present in fewer than two samples were removed prior to CLR #transformation and Aitchison distance analyses to reduce the influence of extremely sparse 
+#taxa.
+
+head(sample_names(otu_all))
+head(rownames(meta_all))
+
+setdiff(sample_names(otu_all), rownames(meta_all))
+setdiff(rownames(meta_all), sample_names(otu_all))
+```
+
+# philr -- Phylogenetic Isometric Log-Ratio Transform. This package provides functions for the analysis of compositional data (e.g., data representing proportions of different variables/parts). Specifically this package allows analysis of compositional data where the parts can be related through a phylogenetic tree (as is common in microbiota survey data) and makes available the Isometric Log Ratio transform built from the phylogenetic tree and utilizing a weighted reference measure.
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("philr")
+```
+
+```{r}
+library(philr)
+library(ape)
+library(vegan)
+library(phyloseq)
+
+# Keep taxa with >10 total counts and present in at least 3 samples
+ps_filt <- filter_taxa(
+  ps_gut,
+  function(x) sum(x) > 10 & sum(x > 0) >= 3,
+  prune = TRUE
+)
+
+cat("Remaining taxa:", ntaxa(ps_filt), "\n")
+cat("Remaining samples:", nsamples(ps_filt), "\n")
+
+# -------------------------------------------------
+# 1. FIX TREE ↔ ASV NAME MISMATCH (robust + automatic)
+# -------------------------------------------------
+
+tree <- phy_tree(ps_filt)
+taxa_ps <- taxa_names(ps_filt)
+
+# If tree tips are DNA sequences instead of ASV IDs,
+# automatically rename them to ASV names using order matching
+if(!any(tree$tip.label %in% taxa_ps)){
+  
+  message("Renaming tree tips to ASV IDs...")
+  
+  # get OTU table taxa order
+  otu_taxa <- taxa_names(ps_filt)
+  
+  # make mapping: sequence order -> ASV names
+  # assumes tree was built from the same sequence set
+  if(length(tree$tip.label) != length(otu_taxa)){
+    stop("Tree and OTU table have different numbers of taxa!")
+  }
+  
+  # rename tree tips to match ASV IDs
+  tree$tip.label <- otu_taxa
+}
+
+# prune tree to exact taxa present
+tree_pruned <- keep.tip(tree, taxa_ps)
+phy_tree(ps_filt) <- tree_pruned
+
+# final safety check
+if(!setequal(taxa_names(ps_filt), phy_tree(ps_filt)$tip.label)){
+  stop("Tree tips and taxa names still do not match!")
+}
+
+message("Tree and taxa successfully matched ✔")
+
+# -------------------------------------------------
+# 2. Run PhILR transform
+# -------------------------------------------------
+# -------------------------------------------------
+# Prepare inputs for philr (SAFE METHOD)
+# -------------------------------------------------
+
+# Extract count matrix
+otu <- as(otu_table(ps_filt), "matrix")
+
+# philr requires samples as rows, taxa as columns
+if(taxa_are_rows(ps_filt)){
+  otu <- t(otu)
+}
+
+# Extract tree
+tree <- phy_tree(ps_filt)
+
+# Final safety check
+stopifnot(all(colnames(otu) == tree$tip.label))
+
+# -------------------------------------------------
+# Run PhILR
+# -------------------------------------------------
+
+philr_ps <- philr(
+  otu,
+  tree,
+  part.weights = "enorm.x.gm.counts",
+  ilr.weights  = "blw.sqrt",
+  return.all   = FALSE,
+  pseudocount  = 0.5
+)
+
+# Euclidean distance
+philr_dist <- dist(philr_ps, method = "euclidean")
+
+# NMDS
+GP.ord.philr <- metaMDS(philr_dist, trymax = 100)
+
+# Extract NMDS scores
+philr_scores <- as.data.frame(scores(GP.ord.philr, display = "sites"))
+
+# Add sample IDs explicitly
+philr_scores$SampleID <- rownames(philr_scores)
+
+# Match metadata safely
+meta <- data.frame(sample_data(ps_filt))
+meta$SampleID <- rownames(meta)
+
+philr_scores <- merge(philr_scores, meta, by = "SampleID")
+
+philr_scores$Condition <- factor(philr_scores$Condition)
+
+# -------------------------------------------------
+# 3. PERMANOVA
+# -------------------------------------------------
+
+adonis_philr <- adonis2(
+  philr_dist ~ Condition,
+  data = data.frame(sample_data(ps_filt)),
+  permutations = 999
+)
+
+F_val <- round(adonis_philr$F[1], 2)
+p_val <- adonis_philr$`Pr(>F)`[1]
+
+
+adonis_label <- expression(italic(F) == 16.77 * "," ~ italic(p) < 0.001 ~ "***")
+
+stress_val <- round(GP.ord.philr$stress, 3)
+stress_label <- paste0("Stress = ", stress_val)
+
+# -------------------------------------------------
+# 4. Ellipses
+# -------------------------------------------------
+
+df_ellipse_philr <- do.call(rbind, lapply(levels(philr_scores$Condition), function(g){
+  group_data <- philr_scores[philr_scores$Condition == g, ]
+  cov_data <- cov.wt(cbind(group_data$NMDS1, group_data$NMDS2),
+                     wt = rep(1 / nrow(group_data), nrow(group_data)))$cov
+  center <- c(mean(group_data$NMDS1), mean(group_data$NMDS2))
+  ellipse_coords <- veganCovEllipse(cov_data, center)
+  data.frame(NMDS1 = ellipse_coords[,1],
+             NMDS2 = ellipse_coords[,2],
+             Condition = g)
+}))
+
+# -------------------------------------------------
+# 5. Plot
+# -------------------------------------------------
+
+philr_nMDS <- ggplot(philr_scores, aes(NMDS1, NMDS2, colour = Condition)) +
+  geom_point(size = 1.5) +
+  geom_path(data = df_ellipse_philr,
+            aes(x = NMDS1, y = NMDS2, colour = Condition, group = Condition),
+            size = 0.8) +
+ scale_color_manual(values = c("Elevated CO2" = "#D4476C",
+                              "Reference"    = "#2C728E")) +
+  labs(color = "Condition") +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(color = "black")
+  ) +
+  annotate("text", x = Inf, y = Inf, label = stress_label,
+           hjust = 1.05, vjust = 2.8, size = 4) +
+  annotate("text", x = Inf, y = Inf, label = adonis_label,
+           hjust = 1.05, vjust = 1.25, size = 4, parse = TRUE)
+
+philr_nMDS
+
+# Save
+ggsave("Figures_Alpha_Beta_div/PhilR_NMDS.png", philr_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+ggsave("Figures_Alpha_Beta_div/PhilR_NMDS.svg", philr_nMDS, width = 15, height = 10, units = "cm", dpi = 900)
+```
+
+# All beta plots
+```{r}
+all.beta.plots <- nMDS + w_unifrac_nMDS + unifrac_nMDS + clr_nMDS + philr_nMDS + plot_layout(nrow = 1)
+
+# This combo says: this pattern is robust across abundance, phylogeny, and compositional methods.
+main.beta.plots <- nMDS + w_unifrac_nMDS + philr_nMDS + plot_layout(nrow = 1)
+
+# Supporting metrics: Unweighted UniFrac (Presence/absence version of phylogenetic signal)
+# CLR Aitchison (Compositional without phylogeny)
+supp.beta.plots <- unifrac_nMDS + clr_nMDS + plot_layout(nrow = 1)
+```
+
+# Patchwork plotting Alpha + Beta Plots
+```{r}
+library(patchwork)
+
+# -----------------------------
+# Remove legends from alpha row
+# -----------------------------
+combined_alpha_plots_nolegend <- combined_alpha_plots +
+  theme(legend.position = "none")
+
+# =====================================================
+# MAIN FIGURE
+# CLR + Weighted UniFrac + PhILR
+# =====================================================
+
+clr_main_noleg        <- clr_nMDS + theme(legend.position = "none")
+w_unifrac_main_noleg  <- w_unifrac_nMDS + ylab(NULL) + theme(legend.position = "none")
+philr_main_legend     <- philr_nMDS + ylab(NULL)   # keep legend here
+
+main_beta_row <- clr_main_noleg +
+                 w_unifrac_main_noleg +
+                 philr_main_legend +
+  plot_layout(ncol = 3, guides = "collect") &
+  theme(legend.position = "bottom")
+
+# Combine alpha + beta (MAIN FIG)
+main_alpha_beta_fig <- combined_alpha_plots_nolegend / main_beta_row +
+  plot_layout(nrow = 2, heights = c(1, 1))
+
+main_alpha_beta_fig
+
+# Save MAIN
+ggsave("Figures_Alpha_Beta_div/Fig_Main_Alpha_Beta.png", plot = main_alpha_beta_fig,
+       width = 24, height = 24, units = "cm", dpi = 900)
+
+ggsave("Figures_Alpha_Beta_div/Fig_Main_Alpha_Beta.svg", plot = main_alpha_beta_fig,
+       width = 24, height = 24, units = "cm", dpi = 900)
+
+
+# =====================================================
+# SUPPLEMENTARY FIGURE
+# Bray–Curtis + Unweighted UniFrac
+# =====================================================
+
+bray_supp_noleg     <- Bray_nMDS + theme(legend.position = "none")
+unifrac_supp_legend <- UW_unifrac_nMDS + ylab(NULL)
+
+supp_beta_fig <- bray_supp_noleg +
+                 unifrac_supp_legend +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+
+supp_beta_fig
+
+# Save SUPPLEMENT
+ggsave("Figures_Alpha_Beta_div/Fig_Supp_Beta_Robustness.png", plot = supp_beta_fig,
+       width = 18, height = 10, units = "cm", dpi = 900)
+
+ggsave("Figures_Alpha_Beta_div/Fig_Supp_Beta_Robustness.svg", plot = supp_beta_fig,
+       width = 18, height = 10, units = "cm", dpi = 900)
+```
+
+```{r}
+# =========================================================
+# Shared microbial taxa: Gut vs Water and Reference vs Elevated CO2
+# =========================================================
+
+library(phyloseq)
+library(dplyr)
+#install.packages("eulerr")
+library(eulerr)
+
+# ---------------------------------------------------------
+# Keep only gut + water samples
+# ---------------------------------------------------------
+
+ps_venn <- subset_samples(
+  ps_shikine,
+  SampleType %in% c("Sample", "H2O")
+)
+
+ps_venn <- prune_taxa(
+  taxa_sums(ps_venn) > 0,
+  ps_venn
+)
+
+# ---------------------------------------------------------
+# Check sample numbers
+# ---------------------------------------------------------
+
+table(
+  sample_data(ps_venn)$SampleType,
+  sample_data(ps_venn)$Condition
+)
+
+# ---------------------------------------------------------
+# Split into four groups
+# ---------------------------------------------------------
+
+ps_ref_gut <- subset_samples(
+  ps_venn,
+  SampleType == "Sample" &
+    Condition == "Reference"
+)
+
+ps_ref_water <- subset_samples(
+  ps_venn,
+  SampleType == "H2O" &
+    Condition == "Reference"
+)
+
+sample_data(ps_ref_water)
+
+ps_high_gut <- subset_samples(
+  ps_venn,
+  SampleType == "Sample" &
+    Condition == "Elevated CO2"
+)
+
+ps_high_water <- subset_samples(
+  ps_venn,
+  SampleType == "H2O" &
+    Condition == "Elevated CO2"
+)
+
+sample_data(ps_high_water)
+
+# Remove taxa absent from each subset
+ps_ref_gut <- prune_taxa(taxa_sums(ps_ref_gut) > 0, ps_ref_gut)
+ps_ref_water <- prune_taxa(taxa_sums(ps_ref_water) > 0, ps_ref_water)
+ps_high_gut <- prune_taxa(taxa_sums(ps_high_gut) > 0, ps_high_gut)
+ps_high_water <- prune_taxa(taxa_sums(ps_high_water) > 0, ps_high_water)
+
+# ---------------------------------------------------------
+# Sample numbers
+# ---------------------------------------------------------
+
+nsamples(ps_ref_gut)
+nsamples(ps_ref_water)
+nsamples(ps_high_gut)
+nsamples(ps_high_water)
+
+# ---------------------------------------------------------
+# Identify core ASVs
+# Core = present in 100% of samples in that group
+# ---------------------------------------------------------
+
+get_core_asvs <- function(ps_obj) {
+
+  otu <- as.data.frame(otu_table(ps_obj))
+
+  if (!taxa_are_rows(ps_obj)) {
+    otu <- t(otu)
+  }
+
+  prevalence <- rowSums(otu > 0)
+
+  names(
+    prevalence[
+      prevalence == nsamples(ps_obj)
+    ]
+  )
+}
+
+core_ref_gut <- get_core_asvs(ps_ref_gut)
+core_ref_water <- get_core_asvs(ps_ref_water)
+core_high_gut <- get_core_asvs(ps_high_gut)
+core_high_water <- get_core_asvs(ps_high_water)
+
+# Check numbers
+sapply(
+  list(
+    Reference_Gut = core_ref_gut,
+    Reference_Water = core_ref_water,
+    Elevated_Gut = core_high_gut,
+    Elevated_Water = core_high_water
+  ),
+  length
+)
+
+# =========================================================
+# Euler diagrams
+# =========================================================
+
+library(eulerr)
+
+# ---------------------------------------------------------
+# Colours
+# ---------------------------------------------------------
+
+gut_fill <- c(
+  Reference = "#2C728E",
+  Elevated = "#D4476C"
+)
+
+gut_line <- c(
+  Reference = "#1F4E64",
+  Elevated = "#9B3654"
+)
+
+water_fill <- c(
+  Reference = "#0080BFFF",
+  Elevated = "#CC0000FF"
+)
+
+water_line <- c(
+  Reference = "#004C73FF",
+  Elevated = "#7A0000FF"
+)
+
+
+# =========================================================
+# 1. Reference: Gut vs Water
+# =========================================================
+
+ref_fit <- euler(
+  list(
+    Gut = core_ref_gut,
+    Water = core_ref_water
+  )
+)
+
+plot(
+  ref_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Reference"],
+      water_fill["Reference"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Reference"],
+      water_line["Reference"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Reference: Gut vs Water"
+)
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Reference_Gut_vs_Water.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  ref_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Reference"],
+      water_fill["Reference"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Reference"],
+      water_line["Reference"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Reference: Gut vs Water"
+)
+
+dev.off()
+
+
+# =========================================================
+# 2. Elevated CO2: Gut vs Water
+# =========================================================
+
+high_fit <- euler(
+  list(
+    Gut = core_high_gut,
+    Water = core_high_water
+  )
+)
+
+plot(
+  high_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Elevated"],
+      water_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Elevated"],
+      water_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Elevated CO2: Gut vs Water"
+)
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Elevated_Gut_vs_Water.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  high_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Elevated"],
+      water_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Elevated"],
+      water_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Elevated CO2: Gut vs Water"
+)
+
+dev.off()
+
+
+# =========================================================
+# 3. Gut: Reference vs Elevated CO2
+# =========================================================
+
+gut_fit <- euler(
+  list(
+    Reference = core_ref_gut,
+    Elevated = core_high_gut
+  )
+)
+
+plot(
+  gut_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Reference"],
+      gut_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Reference"],
+      gut_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Gut: Reference vs Elevated CO2"
+)
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Gut_Reference_vs_Elevated.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  gut_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Reference"],
+      gut_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Reference"],
+      gut_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Gut: Reference vs Elevated CO2"
+)
+
+dev.off()
+
+
+# =========================================================
+# 4. Water: Reference vs Elevated CO2
+# =========================================================
+
+water_fit <- euler(
+  list(
+    Reference = core_ref_water,
+    Elevated = core_high_water
+  )
+)
+
+plot(
+  water_fit,
+  fills = list(
+    fill = unname(c(
+      water_fill["Reference"],
+      water_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      water_line["Reference"],
+      water_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Water: Reference vs Elevated CO2"
+)
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Water_Reference_vs_Elevated.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  water_fit,
+  fills = list(
+    fill = unname(c(
+      water_fill["Reference"],
+      water_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      water_line["Reference"],
+      water_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Water: Reference vs Elevated CO2"
+)
+
+dev.off()
+
+venn_panel <- (venn_ref_plot | venn_high_plot) /
+              (venn_gut_sites | venn_water_sites)
+
+ggsave("Figures_Alpha_Beta_div/combined_venn_diagrams.svg", venn_panel,
+       width = 18, height = 18, units = "cm", dpi = 900)
+```
+
+```{r}
+# =========================================================
+# Euler diagrams
+# =========================================================
+
+library(eulerr)
+library(gridExtra)
+
+# ---------------------------------------------------------
+# Colours
+# ---------------------------------------------------------
+
+gut_fill <- c(
+  Reference = "#2C728E",
+  Elevated = "#D4476C"
+)
+
+gut_line <- c(
+  Reference = "#1F4E64",
+  Elevated = "#9B3654"
+)
+
+water_fill <- c(
+  Reference = "#0080BFFF",
+  Elevated = "#CC0000FF"
+)
+
+water_line <- c(
+  Reference = "#004C73FF",
+  Elevated = "#7A0000FF"
+)
+
+
+# =========================================================
+# Make Euler fits
+# =========================================================
+
+ref_fit <- euler(
+  list(
+    Gut = core_ref_gut,
+    Water = core_ref_water
+  )
+)
+
+high_fit <- euler(
+  list(
+    Gut = core_high_gut,
+    Water = core_high_water
+  )
+)
+
+gut_fit <- euler(
+  list(
+    Reference = core_ref_gut,
+    Elevated = core_high_gut
+  )
+)
+
+water_fit <- euler(
+  list(
+    Reference = core_ref_water,
+    Elevated = core_high_water
+  )
+)
+
+
+# =========================================================
+# 1. Reference: Gut vs Water
+# =========================================================
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Reference_Gut_vs_Water.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  ref_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Reference"],
+      water_fill["Reference"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Reference"],
+      water_line["Reference"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Reference: Gut vs Water"
+)
+
+dev.off()
+
+
+# =========================================================
+# 2. Elevated CO2: Gut vs Water
+# =========================================================
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Elevated_Gut_vs_Water.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  high_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Elevated"],
+      water_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Elevated"],
+      water_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Elevated CO2: Gut vs Water"
+)
+
+dev.off()
+
+
+# =========================================================
+# 3. Gut: Reference vs Elevated CO2
+# =========================================================
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Gut_Reference_vs_Elevated.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  gut_fit,
+  fills = list(
+    fill = unname(c(
+      gut_fill["Reference"],
+      gut_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      gut_line["Reference"],
+      gut_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Gut: Reference vs Elevated CO2"
+)
+
+dev.off()
+
+
+# =========================================================
+# 4. Water: Reference vs Elevated CO2
+# =========================================================
+
+svg(
+  "Figures_Alpha_Beta_div/Euler_Water_Reference_vs_Elevated.svg",
+  width = 6,
+  height = 6
+)
+
+plot(
+  water_fit,
+  fills = list(
+    fill = unname(c(
+      water_fill["Reference"],
+      water_fill["Elevated"]
+    )),
+    alpha = 0.4
+  ),
+  edges = list(
+    col = unname(c(
+      water_line["Reference"],
+      water_line["Elevated"]
+    )),
+    lwd = 1
+  ),
+  labels = TRUE,
+  quantities = TRUE,
+  main = "Water: Reference vs Elevated CO2"
+)
+
+dev.off()
+
+
+# =========================================================
+# Combined 4-panel figure
+# =========================================================
+
+svg(
+  "Figures_Alpha_Beta_div/combined_venn_diagrams.svg",
+  width = 12,
+  height = 12
+)
+
+grid.arrange(
+
+  plot(
+    ref_fit,
+    fills = list(
+      fill = unname(c(
+        gut_fill["Reference"],
+        water_fill["Reference"]
+      )),
+      alpha = 0.4
+    ),
+    edges = list(
+      col = unname(c(
+        gut_line["Reference"],
+        water_line["Reference"]
+      )),
+      lwd = 1
+    ),
+    labels = TRUE,
+    quantities = TRUE,
+    main = "Reference: Gut vs Water"
+  ),
+
+  plot(
+    high_fit,
+    fills = list(
+      fill = unname(c(
+        gut_fill["Elevated"],
+        water_fill["Elevated"]
+      )),
+      alpha = 0.4
+    ),
+    edges = list(
+      col = unname(c(
+        gut_line["Elevated"],
+        water_line["Elevated"]
+      )),
+      lwd = 1
+    ),
+    labels = TRUE,
+    quantities = TRUE,
+    main = "Elevated CO2: Gut vs Water"
+  ),
+
+  plot(
+    gut_fit,
+    fills = list(
+      fill = unname(c(
+        gut_fill["Reference"],
+        gut_fill["Elevated"]
+      )),
+      alpha = 0.4
+    ),
+    edges = list(
+      col = unname(c(
+        gut_line["Reference"],
+        gut_line["Elevated"]
+      )),
+      lwd = 1
+    ),
+    labels = TRUE,
+    quantities = TRUE,
+    main = "Gut: Reference vs Elevated CO2"
+  ),
+
+  plot(
+    water_fit,
+    fills = list(
+      fill = unname(c(
+        water_fill["Reference"],
+        water_fill["Elevated"]
+      )),
+      alpha = 0.4
+    ),
+    edges = list(
+      col = unname(c(
+        water_line["Reference"],
+        water_line["Elevated"]
+      )),
+      lwd = 1
+    ),
+    labels = TRUE,
+    quantities = TRUE,
+    main = "Water: Reference vs Elevated CO2"
+  ),
+
+  ncol = 2
+)
+
+dev.off()
+```
+
+
+
+
+
+
+
