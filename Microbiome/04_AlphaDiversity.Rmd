@@ -123,11 +123,6 @@ ggsave("Figures_Alpha_Beta_div/combined_alpha_plots_clean.svg", combined_alpha_p
 #Stats
 ```{r}
 library(car)
-#Running Levene's test first. When NS, variances in sample groups are similar enough
-#not to raise concerns about unequal variances. You can then proceed to ANOVA.
-#When S, it means there is differences in variance between groups, and proceed with KW.
-
-#avai
 leveneTest(Richness ~ Condition, data = alpha_diversity) #NS = assumptions met
 anov_richness_tissue <- aov(Richness ~ Condition, data = alpha_diversity) 
 summary(anov_richness_tissue)
