@@ -1,2 +1,2 @@
 # ShikineGutMicrobiomeMetaT
-This repository corresponds to the study: Gut microbiome restructuring and sea urchin host–microbe transcriptional responses at a natural CO₂ seep (2026). (Under Review)
+Naturally elevated CO2 reshapes sea urchin diet, gut microbiomes, and host–microbiome transcriptional responses. (Under Review)
