@@ -1,0 +1,202 @@
+---
+title: "00_packages"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load packages
+```{r}
+library(tidyverse)
+library(DESeq2)
+library(clusterProfiler)
+library(apeglm)
+library(ggplot2)
+library(ggrepel)
+```
+
+
+# Filter function
+```{r}
+filt_res <- function(res, padj_cutoff = 0.05, lfc_threshold = 1) {
+  res_df <- as.data.frame(res) %>%
+    rownames_to_column("Gene") %>%
+    filter(!is.na(padj)) %>%  # avoid NA padj values
+    filter(padj < padj_cutoff, abs(log2FoldChange) >= lfc_threshold)
+  
+  return(res_df)
+}
+```
+
+# Building GO enrichment tables
+```{r}
+# =========================================================
+# LOAD LIBRARIES
+# =========================================================
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(GO.db)
+library(clusterProfiler)
+library(enrichplot)
+library(AnnotationDbi)
+library(ggplot2)
+
+# =========================================================
+# LOAD eggNOG ANNOTATIONS
+# =========================================================
+annotations <- read.delim(
+  "Spez_eggnog.emapper.annotations",
+  header = FALSE,
+  stringsAsFactors = FALSE,
+  comment.char = "#"
+)
+
+colnames(annotations) <- c(
+  "query_name","seed_ortholog","evalue","score",
+  "eggNOG_OGs","max_annot_lvl","COG_category",
+  "Description","Preferred_name","GOs",
+  "EC","KEGG_ko","KEGG_pathway","KEGG_module",
+  "KEGG_reaction","KEGG_rclass","BRITE",
+  "KEGG_TC","CAZy","BiGG_Reaction","PFAMs"
+)
+
+# =========================================================
+# CLEAN GO TERMS
+# =========================================================
+annot_clean <- annotations %>%
+  mutate(query_name = str_replace(query_name, "\\.t\\d+$", "")) %>%
+  filter(!is.na(GOs), GOs != "-") %>%
+  mutate(GOs = str_replace_all(GOs, "\\s+", "")) %>%
+  separate_rows(GOs, sep = ",") %>%
+  mutate(GO = str_extract(GOs, "GO:\\d{7}")) %>%
+  filter(!is.na(GO)) %>%
+  dplyr::select(gene = query_name, GO) %>%
+  distinct()
+
+# =========================================================
+# TERM2GENE
+# =========================================================
+TERM2GENE <- annot_clean %>%
+  filter(grepl("^GO:\\d{7}$", GO)) %>%
+  distinct(GO, gene)
+
+# =========================================================
+# TERM2NAME
+# =========================================================
+TERM2NAME <- TERM2GENE %>%
+  distinct(GO) %>%
+  mutate(termName = AnnotationDbi::Term(GO)) %>%
+  filter(!is.na(termName)) %>%
+  rename(term = GO)
+
+# =========================================================
+# ADD ONTOLOGY
+# =========================================================
+go_ont <- AnnotationDbi::select(
+  GO.db,
+  keys = unique(TERM2NAME$term),
+  columns = "ONTOLOGY",
+  keytype = "GOID"
+)
+
+TERM2NAME2 <- TERM2NAME %>%
+  left_join(go_ont, by = c("term" = "GOID")) %>%
+  filter(!is.na(ONTOLOGY)) %>%
+  mutate(ONTOLOGY = factor(ONTOLOGY, levels = c("BP", "CC", "MF")))
+
+# =========================================================
+# GENE LIST
+# =========================================================
+geneList <- res_df_clean %>%
+  dplyr::select(Gene, log2FoldChange) %>%
+  filter(!is.na(log2FoldChange)) %>%
+  distinct()
+
+geneList <- setNames(geneList$log2FoldChange, geneList$Gene)
+geneList <- sort(geneList, decreasing = TRUE)
+```
+
+
+# GO enrichment helper functions
+```{r}
+# =========================================================
+# 0) Add ontology (BP / CC / MF) to TERM2NAME
+# =========================================================
+
+go_ont <- AnnotationDbi::select(
+  GO.db,
+  keys = unique(TERM2NAME$term),
+  columns = "ONTOLOGY",
+  keytype = "GOID"
+)
+
+TERM2NAME2 <- TERM2NAME %>%
+  dplyr::left_join(
+    go_ont,
+    by = c("term" = "GOID")
+  ) %>%
+  dplyr::filter(!is.na(ONTOLOGY))
+
+# =========================================================
+# 1) Utility function: add ontology to enrich result
+# =========================================================
+
+add_ontology_to_enrich <- function(enrich_obj, TERM2NAME2) {
+  
+  if (is.null(enrich_obj) || nrow(as.data.frame(enrich_obj)) == 0) {
+    return(enrich_obj)
+  }
+  
+  df2 <- as.data.frame(enrich_obj) %>%
+    
+    dplyr::left_join(
+      TERM2NAME2 %>% dplyr::select(term, ONTOLOGY),
+      by = c("ID" = "term")
+    ) %>%
+    
+    dplyr::filter(!is.na(ONTOLOGY))
+  
+  enrich_obj@result <- df2
+  
+  return(enrich_obj)
+}
+
+# =========================================================
+# 2) Utility function: top terms per ontology
+# =========================================================
+
+get_top_by_ontology <- function(
+    go_res,
+    n = 15,
+    order_by = "p.adjust"
+) {
+  
+  df <- as.data.frame(go_res)
+  
+  df_top <- df %>%
+    
+    dplyr::filter(!is.na(ONTOLOGY)) %>%
+    dplyr::filter(!is.na(.data[[order_by]])) %>%
+    
+    dplyr::group_by(ONTOLOGY) %>%
+    
+    dplyr::arrange(
+      .data[[order_by]],
+      .by_group = TRUE
+    ) %>%
+    
+    dplyr::slice_head(n = n) %>%
+    
+    dplyr::ungroup()
+  
+  go_res@result <- df_top
+  
+  return(go_res)
+}
+```
+

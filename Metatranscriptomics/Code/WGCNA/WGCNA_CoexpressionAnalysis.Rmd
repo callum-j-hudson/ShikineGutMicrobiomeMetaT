@@ -1,0 +1,3163 @@
+---
+title: "HostMicrobiomeNetworkAnalysis"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# ------------------------------------------------------------
+# Packages
+# ------------------------------------------------------------
+```{r}
+library(dplyr)
+library(tibble)
+library(WGCNA)
+library(clusterProfiler)
+library(stringr)
+library(ggplot2)
+library(pheatmap)
+library(AnnotationDbi)
+library(GO.db)
+```
+
+
+```{r}
+# ------------------------------------------------------------
+# BACTERIAL DATA
+# ------------------------------------------------------------
+
+dds_micro <- readRDS(
+  "PostKraken2/00_TempData/microbial_dds.rds"
+)
+
+vsd_micro <- readRDS("PostKraken2/00_TempData/microbial_vsd.rds")
+
+micro_expr <- assay(vsd_micro)
+
+cat("Bacterial genes:", nrow(micro_expr), "\n")
+cat("Bacterial samples:", ncol(micro_expr), "\n")
+
+head(colnames(micro_expr))
+
+# ------------------------------------------------------------
+# HOST DATA
+# ------------------------------------------------------------
+dds_host <- readRDS("Host_DESEQ/microbial_dds.rds")
+
+vsd_host <- readRDS("Host_DESEQ/microbial_vsd.rds")
+```
+
+```{r}
+# ============================================================
+# MATCH HOST AND BACTERIAL SAMPLES
+# ============================================================
+
+# Extract host metadata
+metadata_host <- as.data.frame(colData(dds_host))
+
+# Extract microbiome metadata
+metadata_micro <- as.data.frame(colData(dds_micro))
+
+# Host sample information
+host_samples <- data.frame(
+  HostSample = colnames(vsd_host),
+  UrchinID = sub(
+    "^[^_]+_([^_]+)_.*$",
+    "\\1",
+    colnames(vsd_host)
+  ),
+  Condition = metadata_host[colnames(vsd_host), "condition"]
+)
+
+# Microbiome sample information
+micro_samples <- data.frame(
+  MicroSample = colnames(vsd_micro),
+  UrchinID = colnames(vsd_micro)
+)
+
+# Match by individual UrchinID
+sample_map <- inner_join(
+  host_samples,
+  micro_samples,
+  by = "UrchinID"
+)
+
+# Check matching
+print(sample_map)
+cat("\nMatched individuals:", nrow(sample_map), "\n")
+table(sample_map$Condition)
+
+# Reorder both matrices using the matched individuals
+host_expr <- assay(vsd_host)[
+  ,
+  sample_map$HostSample,
+  drop = FALSE
+]
+
+micro_expr <- assay(vsd_micro)[
+  ,
+  sample_map$MicroSample,
+  drop = FALSE
+]
+
+# Give both matrices identical sample names
+colnames(host_expr) <- sample_map$UrchinID
+colnames(micro_expr) <- sample_map$UrchinID
+
+# Verify pairing
+stopifnot(identical(
+  colnames(host_expr),
+  colnames(micro_expr)
+))
+
+# Split by treatment
+ref_samples <- sample_map$UrchinID[
+  sample_map$Condition == "Reference"
+]
+
+co2_samples <- sample_map$UrchinID[
+  sample_map$Condition == "Elevated CO2"
+]
+
+host_ref <- host_expr[, ref_samples, drop = FALSE]
+micro_ref <- micro_expr[, ref_samples, drop = FALSE]
+
+host_co2 <- host_expr[, co2_samples, drop = FALSE]
+micro_co2 <- micro_expr[, co2_samples, drop = FALSE]
+
+cat("\nReference samples:", length(ref_samples))
+cat("\nElevated CO2 samples:", length(co2_samples))
+
+cat("\n\nReference dimensions:")
+print(dim(host_ref))
+print(dim(micro_ref))
+
+cat("\nElevated CO2 dimensions:")
+print(dim(host_co2))
+print(dim(micro_co2))
+```
+
+```{r}
+# ============================================================
+# PREPARE WGCNA INPUTS
+# ============================================================
+
+options(stringsAsFactors = FALSE)
+
+# WGCNA requires samples in rows and genes in columns
+datExpr_host <- t(host_expr)
+datExpr_micro <- t(micro_expr)
+
+# Check dimensions
+cat("Host WGCNA input:", dim(datExpr_host), "\n")
+cat("Bacterial WGCNA input:", dim(datExpr_micro), "\n")
+
+# Check that sample order is identical
+stopifnot(identical(
+  rownames(datExpr_host),
+  rownames(datExpr_micro)
+))
+
+# Check for missing values
+sum(is.na(datExpr_host))
+sum(is.na(datExpr_micro))
+
+# Check for duplicated feature names
+anyDuplicated(colnames(datExpr_host))
+anyDuplicated(colnames(datExpr_micro))
+```
+
+# Filter features before network construction
+```{r}
+
+# ============================================================
+# WGCNA: SAMPLE AND GENE QUALITY CONTROL
+# ============================================================
+
+# Check sample and gene quality
+gsg_host <- goodSamplesGenes(datExpr_host, verbose = 3)
+gsg_micro <- goodSamplesGenes(datExpr_micro, verbose = 3)
+
+# Retain all samples and genes passing quality control
+datExpr_host <- datExpr_host[
+  gsg_host$goodSamples,
+  gsg_host$goodGenes,
+  drop = FALSE
+]
+
+datExpr_micro <- datExpr_micro[
+  gsg_micro$goodSamples,
+  gsg_micro$goodGenes,
+  drop = FALSE
+]
+
+# Retain all quality-controlled host genes and bacterial ORFs
+# No additional variance-based filtering
+
+cat("Host genes retained:", ncol(datExpr_host), "\n")
+cat("Bacterial ORFs retained:", ncol(datExpr_micro), "\n")
+
+cat("Matched samples:", nrow(datExpr_host), "\n")
+
+# Confirm sample numbers match between datasets
+stopifnot(
+  identical(rownames(datExpr_host), rownames(datExpr_micro))
+)
+
+```
+
+# Choosing soft thresholding power
+```{r}
+# ============================================================
+# SOFT-THRESHOLDING POWER
+# ============================================================
+
+powers <- c(1:20)
+
+# Host
+sft_host <- pickSoftThreshold(
+  datExpr_host,
+  powerVector = powers,
+  networkType = "unsigned",
+  verbose = 5
+)
+
+# Bacteria
+sft_micro <- pickSoftThreshold(
+  datExpr_micro,
+  powerVector = powers,
+  networkType = "unsigned",
+  verbose = 5
+)
+
+# Plot host scale-free topology fit
+par(mfrow = c(1, 2))
+
+plot(
+  sft_host$fitIndices[, 1],
+  -sign(sft_host$fitIndices[, 3]) *
+    sft_host$fitIndices[, 2],
+  xlab = "Soft-thresholding power",
+  ylab = "Scale-free topology fit (signed R²)",
+  type = "n",
+  main = "Host network"
+)
+
+text(
+  sft_host$fitIndices[, 1],
+  -sign(sft_host$fitIndices[, 3]) *
+    sft_host$fitIndices[, 2],
+  labels = powers
+)
+
+abline(h = 0.8, col = "red", lty = 2)
+
+# Plot bacterial scale-free topology fit
+plot(
+  sft_micro$fitIndices[, 1],
+  -sign(sft_micro$fitIndices[, 3]) *
+    sft_micro$fitIndices[, 2],
+  xlab = "Soft-thresholding power",
+  ylab = "Scale-free topology fit (signed R²)",
+  type = "n",
+  main = "Bacterial network"
+)
+
+text(
+  sft_micro$fitIndices[, 1],
+  -sign(sft_micro$fitIndices[, 3]) *
+    sft_micro$fitIndices[, 2],
+  labels = powers
+)
+
+abline(h = 0.8, col = "red", lty = 2)
+
+par(mfrow = c(1, 1))
+```
+
+
+# Construct Host-Bacteria networks
+```{r}
+# ============================================================
+# SET SOFT-THRESHOLDING POWERS
+# ============================================================
+
+softPower_host <- 6  
+softPower_micro <- 7
+
+# ============================================================
+# CONSTRUCT HOST NETWORK
+# ============================================================
+
+host_net <- blockwiseModules(
+  datExpr_host,
+  power = softPower_host,
+  networkType = "unsigned",
+  TOMType = "unsigned",
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = FALSE,
+  verbose = 3
+)
+
+# ============================================================
+# CONSTRUCT BACTERIAL NETWORK
+# ============================================================
+
+micro_net <- blockwiseModules(
+  datExpr_micro,
+  power = softPower_micro,
+  networkType = "unsigned",
+  TOMType = "unsigned",
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = FALSE,
+  verbose = 3
+)
+
+# Number of modules (excluding grey/unassigned features)
+length(setdiff(unique(host_net$colors), 0))
+length(setdiff(unique(micro_net$colors), 0))
+
+# Number of features per module
+table(host_net$colors)
+table(micro_net$colors)
+```
+
+# Extract module eigengenes
+```{r}
+# ============================================================
+# EXTRACT MODULE EIGENGENES
+# ============================================================
+
+host_ME <- orderMEs(host_net$MEs)
+micro_ME <- orderMEs(micro_net$MEs)
+
+# Check dimensions
+dim(host_ME)
+dim(micro_ME)
+
+head(host_ME)
+head(micro_ME)
+```
+
+# Associate modules with CO2 condition
+```{r}
+# ============================================================
+# SAMPLE TRAITS
+# ============================================================
+
+traits <- data.frame(
+  Condition = ifelse(
+    sample_map$Condition == "Elevated CO2",
+    1,
+    0
+  )
+)
+
+rownames(traits) <- sample_map$UrchinID
+
+# Ensure identical sample order
+traits <- traits[rownames(host_ME), , drop = FALSE]
+
+stopifnot(identical(
+  rownames(traits),
+  rownames(host_ME)
+))
+
+# ============================================================
+# HOST MODULE - CONDITION CORRELATIONS
+# ============================================================
+
+host_trait_cor <- cor(
+  host_ME,
+  traits,
+  use = "pairwise.complete.obs"
+)
+
+host_trait_p <- corPvalueStudent(
+  host_trait_cor,
+  nSamples = nrow(host_ME)
+)
+
+host_trait_results <- data.frame(
+  Module = rownames(host_trait_cor),
+  Correlation = as.numeric(host_trait_cor[, "Condition"]),
+  Pvalue = as.numeric(host_trait_p[, "Condition"])
+) %>%
+  mutate(
+    FDR = p.adjust(Pvalue, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+host_trait_results
+
+# ============================================================
+# BACTERIAL MODULE - CONDITION CORRELATIONS
+# ============================================================
+
+micro_trait_cor <- cor(
+  micro_ME,
+  traits,
+  use = "pairwise.complete.obs"
+)
+
+micro_trait_p <- corPvalueStudent(
+  micro_trait_cor,
+  nSamples = nrow(micro_ME)
+)
+
+micro_trait_results <- data.frame(
+  Module = rownames(micro_trait_cor),
+  Correlation = as.numeric(micro_trait_cor[, "Condition"]),
+  Pvalue = as.numeric(micro_trait_p[, "Condition"])
+) %>%
+  mutate(
+    FDR = p.adjust(Pvalue, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+micro_trait_results
+```
+
+# Correlate host and bacterial modules
+```{r}
+# ============================================================
+# HOST–BACTERIAL MODULE CORRELATIONS
+# ============================================================
+
+# Exclude grey/unassigned features (ME0)
+host_ME_bio <- host_ME[
+  , colnames(host_ME) != "ME0",
+  drop = FALSE
+]
+
+micro_ME_bio <- micro_ME[
+  , colnames(micro_ME) != "ME0",
+  drop = FALSE
+]
+
+# Confirm matched individuals
+stopifnot(
+  identical(rownames(host_ME_bio), rownames(micro_ME_bio))
+)
+
+# Correlate host and bacterial module eigengenes
+module_cor <- cor(
+  host_ME_bio,
+  micro_ME_bio,
+  method = "pearson",
+  use = "pairwise.complete.obs"
+)
+
+# Calculate P-values
+module_p <- corPvalueStudent(
+  module_cor,
+  nSamples = nrow(host_ME_bio)
+)
+
+# Convert results to long format
+module_results <- as.data.frame(
+  as.table(module_cor)
+) %>%
+  rename(
+    HostModule = Var1,
+    MicroModule = Var2,
+    Correlation = Freq
+  ) %>%
+  mutate(
+    Pvalue = as.vector(module_p),
+    FDR = p.adjust(Pvalue, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+# View all associations
+module_results
+
+# View significant associations
+module_results %>%
+  filter(FDR < 0.05)
+
+# Number of significant associations
+sum(module_results$FDR < 0.05, na.rm = TRUE)
+```
+
+# Account for CO₂ treatment in host–bacterial correlations
+```{r}
+# ============================================================
+# TREATMENT-ADJUSTED HOST–BACTERIAL MODULE CORRELATIONS
+# ============================================================
+
+# Remove grey modules
+host_ME_bio <- host_ME[
+  , colnames(host_ME) != "ME0",
+  drop = FALSE
+]
+
+micro_ME_bio <- micro_ME[
+  , colnames(micro_ME) != "ME0",
+  drop = FALSE
+]
+
+# Regress each module eigengene against CO2 treatment
+host_ME_resid <- sapply(
+  colnames(host_ME_bio),
+  function(m) {
+    residuals(lm(host_ME_bio[, m] ~ traits$Condition))
+  }
+)
+
+micro_ME_resid <- sapply(
+  colnames(micro_ME_bio),
+  function(m) {
+    residuals(lm(micro_ME_bio[, m] ~ traits$Condition))
+  }
+)
+
+# Correlate residual eigengenes
+partial_cor <- cor(
+  host_ME_resid,
+  micro_ME_resid,
+  method = "pearson",
+  use = "pairwise.complete.obs"
+)
+
+# Calculate partial correlation P-values
+n <- nrow(host_ME_bio)
+df <- n - 3
+
+partial_t <- partial_cor * sqrt(
+  df / (1 - partial_cor^2)
+)
+
+partial_p <- 2 * pt(
+  -abs(partial_t),
+  df = df
+)
+
+# Adjust for multiple testing
+partial_fdr <- matrix(
+  p.adjust(as.vector(partial_p), method = "BH"),
+  nrow = nrow(partial_p),
+  ncol = ncol(partial_p),
+  dimnames = dimnames(partial_p)
+)
+
+# Extract results
+partial_results <- as.data.frame(
+  as.table(partial_cor)
+) %>%
+  rename(
+    HostModule = Var1,
+    MicroModule = Var2,
+    PartialCorrelation = Freq
+  ) %>%
+  mutate(
+    Pvalue = as.vector(partial_p),
+    FDR = as.vector(partial_fdr)
+  ) %>%
+  arrange(FDR)
+
+partial_results %>%
+  filter(FDR < 0.05)
+
+# Specifically inspect ME10–ME1
+partial_results %>%
+  filter(HostModule == "ME10", MicroModule == "ME1")
+```
+
+```{r}
+# ============================================================
+# EXTRACT FEATURES FROM KEY MODULES
+# ============================================================
+
+# Host module ME10
+host_ME10 <- data.frame(
+  Gene = colnames(datExpr_host),
+  Module = paste0("ME", host_net$colors),
+  kME = cor(
+    datExpr_host,
+    host_ME[, "ME10"],
+    use = "pairwise.complete.obs"
+  )
+) %>%
+  filter(Module == "ME10") %>%
+  arrange(desc(abs(kME)))
+
+# Bacterial module ME1
+micro_ME1 <- data.frame(
+  ORF = colnames(datExpr_micro),
+  Module = paste0("ME", micro_net$colors),
+  kME = cor(
+    datExpr_micro,
+    micro_ME[, "ME1"],
+    use = "pairwise.complete.obs"
+  )
+) %>%
+  filter(Module == "ME1") %>%
+  arrange(desc(abs(kME)))
+
+# Inspect top 20 features
+head(host_ME10, 20)
+head(micro_ME1, 20)
+
+# Export
+write.csv(
+  host_ME10,
+  "WGCNA/WGCNA_host_ME10_genes.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  micro_ME1,
+  "WGCNA/WGCNA_bacterial_ME1_ORFs.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+
+# ============================================================
+# MODULE–TREATMENT CORRELATION HEATMAP
+# Combined host and microbiome WGCNA networks
+# ============================================================
+
+library(WGCNA)
+library(pheatmap)
+library(dplyr)
+
+# ------------------------------------------------------------
+# 1. Prepare data
+# ------------------------------------------------------------
+
+host_ME_bio <- host_ME[, colnames(host_ME) != "ME0", drop = FALSE]
+micro_ME_bio <- micro_ME[, colnames(micro_ME) != "ME0", drop = FALSE]
+
+traits <- traits[rownames(host_ME_bio), , drop = FALSE]
+
+stopifnot(
+  identical(rownames(host_ME_bio), rownames(micro_ME_bio)),
+  identical(rownames(host_ME_bio), rownames(traits))
+)
+
+condition <- traits$Condition
+n <- sum(complete.cases(condition))
+
+# ------------------------------------------------------------
+# 2. Host module–treatment correlations
+# ------------------------------------------------------------
+
+host_cor <- cor(
+  host_ME_bio,
+  condition,
+  method = "pearson",
+  use = "complete.obs"
+)
+
+host_p <- corPvalueStudent(host_cor, nSamples = n)
+
+# FDR correction within host modules only
+host_fdr <- p.adjust(host_p, method = "BH")
+
+names(host_cor) <- colnames(host_ME_bio)
+names(host_fdr) <- colnames(host_ME_bio)
+
+# ------------------------------------------------------------
+# 3. Microbiome module–treatment correlations
+# ------------------------------------------------------------
+
+micro_cor <- cor(
+  micro_ME_bio,
+  condition,
+  method = "pearson",
+  use = "complete.obs"
+)
+
+micro_p <- corPvalueStudent(micro_cor, nSamples = n)
+
+# FDR correction within microbiome modules only
+micro_fdr <- p.adjust(micro_p, method = "BH")
+
+names(micro_cor) <- colnames(micro_ME_bio)
+names(micro_fdr) <- colnames(micro_ME_bio)
+
+
+
+# ------------------------------------------------------------
+# 4. Combine results for visualisation
+# ------------------------------------------------------------
+
+host_names <- colnames(host_ME_bio)
+micro_names <- paste0("m_", colnames(micro_ME_bio))
+
+# Explicitly preserve module names
+names(host_cor) <- host_names
+names(micro_cor) <- micro_names
+
+names(host_fdr) <- host_names
+names(micro_fdr) <- micro_names
+
+names(host_p) <- host_names
+names(micro_p) <- micro_names
+
+module_names <- c(host_names, micro_names)
+
+combined_cor <- c(
+  as.numeric(host_cor),
+  as.numeric(micro_cor)
+)
+
+combined_fdr <- c(
+  as.numeric(host_fdr),
+  as.numeric(micro_fdr)
+)
+
+combined_p <- c(
+  as.numeric(host_p),
+  as.numeric(micro_p)
+)
+
+names(combined_cor) <- module_names
+names(combined_fdr) <- module_names
+names(combined_p) <- module_names
+
+heatmap_data <- matrix(
+  combined_cor,
+  ncol = 1,
+  dimnames = list(module_names, "CO2 condition")
+)
+
+# Display coefficients only for FDR-significant modules
+display_data <- matrix(
+  "",
+  nrow = length(combined_cor),
+  ncol = 1,
+  dimnames = dimnames(heatmap_data)
+)
+
+significant <- combined_fdr < 0.05
+
+display_data[significant, 1] <- sprintf(
+  "%.2f",
+  combined_cor[significant]
+)
+
+# ------------------------------------------------------------
+# 5. Annotate datasets
+# ------------------------------------------------------------
+
+row_annotation <- data.frame(
+  Dataset = factor(
+    c(
+      rep("Host", length(host_names)),
+      rep("Microbiome", length(micro_names))
+    ),
+    levels = c("Host", "Microbiome")
+  ),
+  row.names = module_names
+)
+
+# ------------------------------------------------------------
+# 6. Plot combined heatmap
+# ------------------------------------------------------------
+
+library(grid)
+
+p <- pheatmap(
+  heatmap_data,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-1, 1, length.out = 101),
+  display_numbers = display_data,
+  number_color = "black",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  annotation_row = row_annotation,
+  gaps_row = length(host_names),
+  border_color = NA,
+  main = "Module eigengene associations with CO2 condition",
+  angle_col = 0,
+  fontsize = 10,
+  fontsize_number = 9,
+  cellwidth = 90,
+  cellheight = 15,
+  legend = TRUE
+)
+
+# Add rho as the colour-scale title
+grid.text(
+  expression(rho),
+  x = unit(0.96, "npc"),
+  y = unit(0.82, "npc"),
+  gp = gpar(fontsize = 11)
+)
+
+# ------------------------------------------------------------
+# 7. Export results
+# ------------------------------------------------------------
+
+host_results <- data.frame(
+  Module = host_names,
+  Dataset = "Host",
+  Correlation = as.numeric(host_cor),
+  Pvalue = as.numeric(host_p),
+  FDR = as.numeric(host_fdr)
+)
+
+micro_results <- data.frame(
+  Module = micro_names,
+  Dataset = "Microbiome",
+  Correlation = as.numeric(micro_cor),
+  Pvalue = as.numeric(micro_p),
+  FDR = as.numeric(micro_fdr)
+)
+
+combined_results <- bind_rows(host_results, micro_results)
+
+write.csv(
+  combined_results,
+  "WGCNA/Combined_module_CO2_correlations.csv",
+  row.names = FALSE
+)
+
+# Check all modules are present
+print(heatmap_data)
+print(combined_results %>% filter(FDR < 0.05))
+
+```
+
+
+```{r}
+
+# ============================================================
+# HOST–MICROBIOME MODULE EIGENGENE CORRELATION HEATMAP
+# Modules annotated by association with CO2 treatment
+# ============================================================
+# ------------------------------------------------------------
+# 1. Prepare data
+# ------------------------------------------------------------
+
+# Exclude grey/unassigned modules
+host_ME_bio <- host_ME[, colnames(host_ME) != "ME0", drop = FALSE]
+micro_ME_bio <- micro_ME[, colnames(micro_ME) != "ME0", drop = FALSE]
+
+# Align treatment metadata
+traits <- traits[rownames(host_ME_bio), , drop = FALSE]
+
+stopifnot(
+  identical(rownames(host_ME_bio), rownames(micro_ME_bio)),
+  identical(rownames(host_ME_bio), rownames(traits))
+)
+
+condition <- traits$Condition
+n <- sum(complete.cases(condition))
+
+# ------------------------------------------------------------
+# 2. Host–microbiome module correlations
+# ------------------------------------------------------------
+
+cor_cross <- cor(
+  host_ME_bio,
+  micro_ME_bio,
+  method = "pearson",
+  use = "complete.obs"
+)
+
+p_cross <- corPvalueStudent(
+  cor_cross,
+  nSamples = n
+)
+
+# ------------------------------------------------------------
+# 3. Host module associations with CO2 treatment
+# ------------------------------------------------------------
+
+host_treatment_cor <- cor(
+  host_ME_bio,
+  condition,
+  method = "pearson",
+  use = "complete.obs"
+)
+
+host_treatment_p <- corPvalueStudent(
+  host_treatment_cor,
+  nSamples = n
+)
+
+# FDR correction within host modules
+host_treatment_fdr <- p.adjust(
+  host_treatment_p,
+  method = "BH"
+)
+
+names(host_treatment_fdr) <- colnames(host_ME_bio)
+
+# ------------------------------------------------------------
+# 4. Microbiome module associations with CO2 treatment
+# ------------------------------------------------------------
+
+micro_treatment_cor <- cor(
+  micro_ME_bio,
+  condition,
+  method = "pearson",
+  use = "complete.obs"
+)
+
+micro_treatment_p <- corPvalueStudent(
+  micro_treatment_cor,
+  nSamples = n
+)
+
+# FDR correction within microbiome modules
+micro_treatment_fdr <- p.adjust(
+  micro_treatment_p,
+  method = "BH"
+)
+
+names(micro_treatment_fdr) <- colnames(micro_ME_bio)
+
+# ------------------------------------------------------------
+# 5. Prepare module names and annotations
+# ------------------------------------------------------------
+
+# Prefix microbiome modules to distinguish them from host modules
+host_names <- colnames(host_ME_bio)
+micro_names <- paste0("m_", colnames(micro_ME_bio))
+
+# Rename correlation matrix columns
+colnames(cor_cross) <- micro_names
+colnames(p_cross) <- micro_names
+
+# Host annotation: significant or not significant for CO2
+host_annotation <- data.frame(
+  CO2_association = factor(
+    ifelse(host_treatment_fdr < 0.05,
+           "Significant", "Not significant"),
+    levels = c("Significant", "Not significant")
+  ),
+  row.names = host_names
+)
+
+# Microbiome annotation: significant or not significant for CO2
+micro_annotation <- data.frame(
+  CO2_association = factor(
+    ifelse(micro_treatment_fdr < 0.05,
+           "Significant", "Not significant"),
+    levels = c("Significant", "Not significant")
+  ),
+  row.names = micro_names
+)
+
+# Check annotation alignment
+stopifnot(
+  identical(rownames(host_annotation), rownames(cor_cross)),
+  identical(rownames(micro_annotation), colnames(cor_cross))
+)
+
+# ------------------------------------------------------------
+# 6. Display significant cross-domain correlations
+# ------------------------------------------------------------
+
+# Display correlation coefficients only where P < 0.05
+display_data <- matrix(
+  "",
+  nrow = nrow(cor_cross),
+  ncol = ncol(cor_cross),
+  dimnames = dimnames(cor_cross)
+)
+
+display_data[p_cross < 0.05] <- sprintf(
+  "%.2f",
+  cor_cross[p_cross < 0.05]
+)
+
+# ------------------------------------------------------------
+# 7. Annotation colours
+# ------------------------------------------------------------
+
+annotation_colours <- list(
+  CO2_association = c(
+    "Significant" = "#E6AB02",
+    "Not significant" = "#E6E6E6"
+  )
+)
+
+# ------------------------------------------------------------
+# 8. Plot and save heatmap as SVG
+# ------------------------------------------------------------
+
+p_cross_heatmap <- pheatmap(
+  cor_cross,
+
+  color = colorRampPalette(
+  c("#2166AC", "white", "#c92f2aff")
+)(100),
+
+  breaks = seq(-1, 1, length.out = 101),
+
+  display_numbers = display_data,
+  number_color = "black",
+  fontsize_number = 8,
+
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+
+  annotation_row = host_annotation,
+  annotation_col = micro_annotation,
+  annotation_colors = annotation_colours,
+
+  annotation_names_row = FALSE,
+  annotation_names_col = FALSE,
+
+  border_color = "grey75",
+
+  main = "Host–microbiome module eigengene correlations",
+
+  angle_col = 45,
+  fontsize = 9,
+  cellwidth = 22,
+  cellheight = 13,
+
+  legend = TRUE,
+
+  silent = TRUE
+)
+
+# Display heatmap in R
+grid::grid.newpage()
+grid::grid.draw(p_cross_heatmap$gtable)
+
+# Save as SVG
+svglite::svglite(
+  "WGCNA/Host_Microbiome_Module_Correlation_Heatmap.svg",
+  width = 4,
+  height = 6
+)
+
+grid::grid.newpage()
+grid::grid.draw(p_cross_heatmap$gtable)
+
+dev.off()
+
+# ------------------------------------------------------------
+# 9. Export correlation results
+# ------------------------------------------------------------
+
+cross_results <- as.data.frame(as.table(cor_cross)) %>%
+  rename(
+    HostModule = Var1,
+    MicrobiomeModule = Var2,
+    Correlation = Freq
+  ) %>%
+  mutate(
+    Pvalue = as.vector(p_cross),
+    Significant = Pvalue < 0.05
+  ) %>%
+  arrange(Pvalue)
+
+write.csv(
+  cross_results,
+  "WGCNA/Host_microbiome_module_correlations.csv",
+  row.names = FALSE
+)
+
+# Export treatment associations separately
+host_treatment_results <- data.frame(
+  Module = host_names,
+  Correlation = as.numeric(host_treatment_cor),
+  Pvalue = as.numeric(host_treatment_p),
+  FDR = as.numeric(host_treatment_fdr)
+)
+
+micro_treatment_results <- data.frame(
+  Module = micro_names,
+  Correlation = as.numeric(micro_treatment_cor),
+  Pvalue = as.numeric(micro_treatment_p),
+  FDR = as.numeric(micro_treatment_fdr)
+)
+
+write.csv(
+  host_treatment_results,
+  "WGCNA/Host_module_CO2_correlations.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  micro_treatment_results,
+  "WGCNA/Microbiome_module_CO2_correlations.csv",
+  row.names = FALSE
+)
+
+```
+
+# Figure X. Host–microbiome module eigengene correlations and associations with elevated CO₂ treatment. Heatmap showing Pearson correlation coefficients (ρ) between host and microbiome WGCNA module eigengenes across individual sea urchins. Numerical values are displayed for statistically significant host–microbiome correlations (P < 0.05). Annotations along the respective axes indicate modules significantly associated with CO₂ treatment (Reference versus Elevated CO₂; Benjamini–Hochberg-adjusted FDR < 0.05). Positive correlations with the treatment indicate higher module eigengene values under Elevated CO₂, whereas negative correlations indicate higher values under Reference conditions. 
+
+
+```{r}
+host_treatment_results %>%
+  filter(FDR < 0.05) %>%
+  select(Module, Correlation, Pvalue, FDR) %>%
+  arrange(desc(Correlation))
+
+micro_treatment_results %>%
+  filter(FDR < 0.05) %>%
+  select(Module, Correlation, Pvalue, FDR) %>%
+  arrange(desc(Correlation))
+```
+
+
+```{r}
+# ============================================================
+# BACTERIA: LOAD EGGNOG ANNOTATIONS
+# ============================================================
+
+library(data.table)
+
+eggnog_micro <- fread(
+  "PostKraken2/postkraken_eggnog.emapper.annotations",
+  comment.char = "#",
+  header = FALSE,
+  fill = TRUE,
+  sep = "\t"
+)
+
+colnames(eggnog_micro) <- c(
+  "query", "seed_ortholog", "evalue", "score",
+  "eggNOG_OGs", "max_annot_lvl", "COG_category",
+  "Description", "Preferred_name", "GOs",
+  "EC", "KEGG_ko", "KEGG_Pathway", "KEGG_Module",
+  "KEGG_Reaction", "KEGG_rclass", "BRITE",
+  "KEGG_TC", "CAZy", "BiGG_Reaction", "PFAMs"
+)
+
+# Convert Prodigal ORF IDs to parent transcript IDs
+eggnog_micro <- eggnog_micro %>%
+  mutate(
+    ORF = str_remove(query, "_[0-9]+$")
+  )
+
+cat("Unique annotated parent transcripts:",
+    n_distinct(eggnog_micro$ORF), "\n")
+```
+
+```{r}
+# ============================================================
+# HOST: LOAD EGGNOG ANNOTATIONS
+# ============================================================
+annotations <- read.delim(
+  "Spez_eggnog.emapper.annotations",
+  header = FALSE,
+  stringsAsFactors = FALSE,
+  comment.char = "#"
+)
+
+colnames(annotations) <- c(
+  "query_name", "seed_ortholog", "evalue", "score",
+  "eggNOG_OGs", "max_annot_lvl", "COG_category",
+  "Description", "Preferred_name", "GOs",
+  "EC", "KEGG_ko", "KEGG_pathway", "KEGG_module",
+  "KEGG_reaction", "KEGG_rclass", "BRITE",
+  "KEGG_TC", "CAZy", "BiGG_Reaction", "PFAMs"
+)
+
+# Convert transcript IDs to gene IDs
+annotations <- annotations %>%
+  mutate(
+    Gene = str_replace(query_name, "\\.t\\d+$", "")
+  )
+```
+
+```{r}
+# ============================================================
+# HOST: BUILD GO TERM2GENE
+# ============================================================
+
+annot_clean <- annotations %>%
+  filter(
+    !is.na(GOs),
+    GOs != "-"
+  ) %>%
+  mutate(
+    GOs = str_replace_all(GOs, "\\s+", "")
+  ) %>%
+  separate_rows(GOs, sep = ",") %>%
+  mutate(
+    GO = str_extract(GOs, "GO:\\d{7}")
+  ) %>%
+  filter(!is.na(GO)) %>%
+  select(Gene, GO) %>%
+  distinct()
+
+TERM2GENE_host <- annot_clean %>%
+  select(term = GO, gene = Gene) %>%
+  distinct()
+
+# Retrieve GO term descriptions
+TERM2NAME_host <- TERM2GENE_host %>%
+  distinct(term) %>%
+  mutate(
+    name = AnnotationDbi::Term(term)
+  ) %>%
+  filter(!is.na(name)) %>%
+  distinct(term, .keep_all = TRUE)
+
+cat("Host genes with GO annotations:",
+    n_distinct(TERM2GENE_host$gene), "\n")
+cat("Unique GO terms:",
+    n_distinct(TERM2GENE_host$term), "\n")
+```
+
+# Host modules correlated with microbiome modules contained genes annotated to...?
+```{r}
+
+# ============================================================
+# HOST: GSEA OF CORRELATED MODULES
+# ============================================================
+# Host modules correlated with microbiome modules
+host_modules_to_test <- c("10")
+
+# ============================================================
+# 1. PREPARE GENE-LEVEL ANNOTATION MAPPING
+# ============================================================
+
+annotations <- annotations %>%
+  mutate(
+    Gene = str_remove(query_name, "\\.t\\d+$")
+  )
+
+# GO BP background
+host_universe_GO <- intersect(
+  str_remove(colnames(datExpr_host), "\\.t\\d+$"),
+  unique(TERM2GENE_BP$gene)
+)
+
+cat(
+  "Host WGCNA genes with GO BP annotations:",
+  length(host_universe_GO), "\n"
+)
+
+# ============================================================
+# 2. RUN GSEA FOR EACH CORRELATED HOST MODULE
+# ============================================================
+
+host_GSEA_results <- bind_rows(
+
+  lapply(host_modules_to_test, function(module_id) {
+
+    ME_name <- paste0("ME", module_id)
+
+    if (!ME_name %in% colnames(host_ME)) {
+      stop("Cannot find ", ME_name, " in host_ME.")
+    }
+
+    cat("\nRunning GSEA for", ME_name, "\n")
+
+    # Calculate kME for every WGCNA transcript
+    kME_values <- as.numeric(
+      cor(
+        datExpr_host,
+        host_ME[, ME_name],
+        use = "pairwise.complete.obs"
+      )
+    )
+
+    names(kME_values) <- colnames(datExpr_host)
+
+    # Convert WGCNA transcript IDs to gene IDs
+    host_rank_df <- tibble(
+      Transcript = names(kME_values),
+      kME = kME_values
+    ) %>%
+      filter(is.finite(kME)) %>%
+      mutate(
+        Gene = str_remove(Transcript, "\\.t\\d+$")
+      ) %>%
+      filter(Gene %in% host_universe_GO) %>%
+      group_by(Gene) %>%
+      summarise(
+        abs_kME = max(abs(kME), na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      filter(is.finite(abs_kME)) %>%
+      arrange(desc(abs_kME))
+
+    # Ranked gene list
+    geneList_host <- setNames(
+      host_rank_df$abs_kME,
+      host_rank_df$Gene
+    )
+
+    geneList_host <- sort(
+      geneList_host,
+      decreasing = TRUE
+    )
+
+    cat(
+      "Genes in ranked list:",
+      length(geneList_host), "\n"
+    )
+
+    # Check mapping before GSEA
+    if (length(geneList_host) < 10) {
+      warning(
+        "Too few mapped genes for ", ME_name,
+        ". Check gene ID matching."
+      )
+      return(NULL)
+    }
+
+    if (anyDuplicated(names(geneList_host))) {
+      stop("Duplicate gene IDs in ranked list for ", ME_name)
+    }
+
+    # Run GSEA
+    gsea_result <- clusterProfiler::GSEA(
+      geneList = geneList_host,
+      TERM2GENE = TERM2GENE_BP,
+      TERM2NAME = TERM2NAME_BP,
+      minGSSize = 5,
+      maxGSSize = 500,
+      pAdjustMethod = "BH",
+      pvalueCutoff = 1,
+      verbose = FALSE,
+      seed = TRUE
+    )
+
+    if (is.null(gsea_result)) {
+      return(NULL)
+    }
+
+    result_df <- as.data.frame(gsea_result)
+
+    if (nrow(result_df) == 0) {
+      return(NULL)
+    }
+
+    result_df %>%
+      mutate(
+        Host_module = ME_name
+      )
+
+  })
+)
+
+# ============================================================
+# 3. INSPECT AND EXPORT RESULTS
+# ============================================================
+
+if (nrow(host_GSEA_results) > 0) {
+
+  # GSEA already applies BH correction across terms
+  host_GSEA_results <- host_GSEA_results %>%
+    arrange(p.adjust)
+
+  host_GSEA_sig <- host_GSEA_results %>%
+    filter(p.adjust < 0.05)
+
+  cat(
+    "\nSignificant GO BP terms:",
+    nrow(host_GSEA_sig), "\n"
+  )
+
+  print(
+    host_GSEA_sig %>%
+      select(
+        Host_module,
+        ID,
+        Description,
+        setSize,
+        enrichmentScore,
+        NES,
+        pvalue,
+        p.adjust
+      )
+  )
+
+  write.csv(
+    host_GSEA_results,
+    "Host_correlated_modules_GO_BP_GSEA.csv",
+    row.names = FALSE
+  )
+
+} else {
+
+  host_GSEA_sig <- tibble()
+
+  message("No GSEA results returned.")
+
+}
+
+# ============================================================
+# 4. GSEA DOT PLOT
+# ============================================================
+
+if (nrow(host_GSEA_sig) > 0) {
+
+  plot_data <- host_GSEA_sig %>%
+    group_by(Host_module) %>%
+    slice_min(
+      order_by = p.adjust,
+      n = 21,
+      with_ties = FALSE
+    ) %>%
+    ungroup() %>%
+    mutate(
+      Description = str_wrap(Description, width = 45),
+      LeadingEdgeSize = lengths(
+        strsplit(core_enrichment, "/", fixed = TRUE)
+      )
+    ) %>%
+    group_by(Host_module) %>%
+    arrange(NES, .by_group = TRUE) %>%
+    mutate(
+      Plot_label = factor(
+        paste0(Description, " [", ID, "]"),
+        levels = unique(paste0(Description, " [", ID, "]"))
+      )
+    ) %>%
+    ungroup()
+
+  p_host_GSEA <- ggplot(
+    plot_data,
+    aes(x = NES, y = Plot_label)
+  ) +
+    geom_point(
+      aes(
+        size = LeadingEdgeSize,
+        colour = -log10(p.adjust)
+      ),
+      alpha = 0.9
+    ) +
+    facet_wrap(
+      ~ Host_module,
+      scales = "free_y"
+    ) +
+    scale_colour_gradient(
+      low = "#67A9CF",
+      high = "#D73027",
+      name = expression(-log[10](FDR))
+    ) +
+    scale_size_continuous(
+      range = c(2, 8),
+      name = "Leading-edge genes"
+    ) +
+    labs(
+      x = "Normalised enrichment score (NES)",
+      y = NULL,
+      title = "Biological processes associated with host modules",
+      subtitle = "GO Biological Process GSEA using absolute module membership"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.y = element_text(colour = "black", size = 9),
+      plot.title = element_text(face = "bold"),
+      legend.position = "right",
+      strip.text = element_text(face = "bold")
+    )
+
+  print(p_host_GSEA)
+
+  # Save as editable vector graphic
+  ggsave(
+    filename = "WGCNA/Host_GO_GSEA.svg",
+    plot = p_host_GSEA,
+    device = "svg",
+    width = 8,
+    height = 6,
+    units = "in",
+    bg = "white"
+  )
+}
+
+```
+
+# Gene set enrichment analysis of biological processes associated with the host WGCNA module correlated with the microbiome module. Gene set enrichment analysis (GSEA) was performed using Gene Ontology (GO) Biological Process annotations, with host genes ranked by their absolute module membership (|kME|) for the correlated host module (ME10). Dot plots show the 21 most significantly enriched GO terms (Benjamini–Hochberg-adjusted p < 0.05). The normalised enrichment score (NES) indicates the strength of enrichment, dot size represents the number of leading-edge genes contributing to each term, and colour indicates the adjusted p-value (−log₁₀ FDR).
+
+# Functional enrichment analysis revealed that host module ME10, which was correlated with microbial module ME1, was significantly enriched in biological processes associated with digestion, intestinal absorption, ion transport and bicarbonate transport (Fig. X).
+
+
+```{r}
+
+# ============================================================
+# HOST: GSEA OF CO2-ASSOCIATED MODULES
+# ME13, ME3, ME24
+# ============================================================
+# Host modules correlated with CO2 condition
+host_modules_to_test <- c("13", "3", "24")
+
+# ============================================================
+# 1. PREPARE GENE-LEVEL ANNOTATION MAPPING
+# ============================================================
+
+annotations <- annotations %>%
+  mutate(
+    Gene = str_remove(query_name, "\\.t\\d+$")
+  )
+
+# GO BP background
+host_universe_GO <- intersect(
+  str_remove(colnames(datExpr_host), "\\.t\\d+$"),
+  unique(TERM2GENE_BP$gene)
+)
+
+cat(
+  "Host WGCNA genes with GO BP annotations:",
+  length(host_universe_GO), "\n"
+)
+
+# ============================================================
+# 2. RUN GSEA FOR EACH HOST MODULE
+# ============================================================
+
+host_GSEA_results <- bind_rows(
+
+  lapply(host_modules_to_test, function(module_id) {
+
+    ME_name <- paste0("ME", module_id)
+
+    if (!ME_name %in% colnames(host_ME)) {
+      stop("Cannot find ", ME_name, " in host_ME.")
+    }
+
+    cat("\nRunning GSEA for", ME_name, "\n")
+
+    # Calculate kME for every WGCNA transcript
+    kME_values <- as.numeric(
+      cor(
+        datExpr_host,
+        host_ME[, ME_name],
+        use = "pairwise.complete.obs"
+      )
+    )
+
+    names(kME_values) <- colnames(datExpr_host)
+
+    # Convert transcript IDs to gene IDs
+    host_rank_df <- tibble(
+      Transcript = names(kME_values),
+      kME = kME_values
+    ) %>%
+      filter(is.finite(kME)) %>%
+      mutate(
+        Gene = str_remove(Transcript, "\\.t\\d+$")
+      ) %>%
+      filter(Gene %in% host_universe_GO) %>%
+      group_by(Gene) %>%
+      summarise(
+        abs_kME = max(abs(kME), na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      filter(is.finite(abs_kME)) %>%
+      arrange(desc(abs_kME))
+
+    # Ranked gene list
+    geneList_host <- setNames(
+      host_rank_df$abs_kME,
+      host_rank_df$Gene
+    )
+
+    geneList_host <- sort(
+      geneList_host,
+      decreasing = TRUE
+    )
+
+    cat(
+      "Genes in ranked list:",
+      length(geneList_host), "\n"
+    )
+
+    if (length(geneList_host) < 10) {
+      warning(
+        "Too few mapped genes for ", ME_name,
+        ". Check gene ID matching."
+      )
+      return(NULL)
+    }
+
+    if (anyDuplicated(names(geneList_host))) {
+      stop("Duplicate gene IDs in ranked list for ", ME_name)
+    }
+
+    # Run GSEA
+    gsea_result <- clusterProfiler::GSEA(
+      geneList = geneList_host,
+      TERM2GENE = TERM2GENE_BP,
+      TERM2NAME = TERM2NAME_BP,
+      minGSSize = 5,
+      maxGSSize = 500,
+      pAdjustMethod = "BH",
+      pvalueCutoff = 1,
+      verbose = FALSE,
+      seed = TRUE
+    )
+
+    if (is.null(gsea_result)) {
+      return(NULL)
+    }
+
+    result_df <- as.data.frame(gsea_result)
+
+    if (nrow(result_df) == 0) {
+      return(NULL)
+    }
+
+    result_df %>%
+      mutate(
+        Host_module = ME_name
+      )
+
+  })
+)
+
+# ============================================================
+# 3. INSPECT AND EXPORT RESULTS
+# ============================================================
+
+if (nrow(host_GSEA_results) > 0) {
+
+  host_GSEA_results <- host_GSEA_results %>%
+    mutate(
+      Host_module = factor(
+        Host_module,
+        levels = paste0("ME", host_modules_to_test)
+      )
+    ) %>%
+    arrange(Host_module, p.adjust)
+
+  host_GSEA_sig <- host_GSEA_results %>%
+    filter(p.adjust < 0.05)
+
+  cat(
+    "\nSignificant GO BP terms:",
+    nrow(host_GSEA_sig), "\n"
+  )
+
+  print(
+    host_GSEA_sig %>%
+      select(
+        Host_module,
+        ID,
+        Description,
+        setSize,
+        enrichmentScore,
+        NES,
+        pvalue,
+        p.adjust
+      )
+  )
+
+  write.csv(
+    host_GSEA_results,
+    "Host_CO2_associated_modules_GO_BP_GSEA.csv",
+    row.names = FALSE
+  )
+
+} else {
+
+  host_GSEA_sig <- tibble()
+
+  message("No GSEA results returned.")
+
+}
+
+# ============================================================
+# 4. PREPARE PLOT DATA
+# ============================================================
+
+if (nrow(host_GSEA_sig) > 0) {
+
+  plot_data <- host_GSEA_sig %>%
+
+    # Select top 21 significant terms per module
+    group_by(Host_module) %>%
+    slice_min(
+      order_by = p.adjust,
+      n = 15,
+      with_ties = FALSE
+    ) %>%
+    ungroup() %>%
+
+    mutate(
+      Description = str_wrap(Description, width = 40),
+
+      LeadingEdgeSize = vapply(
+        strsplit(
+          ifelse(
+            is.na(core_enrichment),
+            "",
+            core_enrichment
+          ),
+          "/",
+          fixed = TRUE
+        ),
+        function(x) sum(nzchar(x)),
+        integer(1)
+      ),
+
+      Plot_label = paste0(
+        Description,
+        " [",
+        ID,
+        "]"
+      )
+    ) %>%
+
+    # Set panel order and term order
+    arrange(Host_module, NES) %>%
+    mutate(
+      Host_module = factor(
+        Host_module,
+        levels = paste0("ME", host_modules_to_test)
+      ),
+      Plot_label = factor(
+        Plot_label,
+        levels = unique(Plot_label)
+      )
+    )
+
+  # ============================================================
+  # 5. THREE-PANEL GSEA DOT PLOT
+  # ============================================================
+
+  p_host_GSEA <- ggplot(
+    plot_data,
+    aes(
+      x = NES,
+      y = Plot_label
+    )
+  ) +
+
+    geom_point(
+      aes(
+        size = LeadingEdgeSize,
+        colour = -log10(p.adjust)
+      ),
+      alpha = 0.9
+    ) +
+
+    facet_wrap(
+      ~ Host_module,
+      nrow = 1,
+      scales = "free_y",
+      drop = FALSE
+    ) +
+
+    scale_colour_gradient(
+      low = "#67A9CF",
+      high = "#D73027",
+      name = expression(-log[10](FDR))
+    ) +
+
+    scale_size_continuous(
+      range = c(2, 8),
+      name = "Leading-edge genes"
+    ) +
+
+    labs(
+      x = "Normalised enrichment score (NES)",
+      y = NULL,
+      title = "Biological processes associated with CO2-correlated host modules",
+      subtitle = "GO Biological Process GSEA ranked by absolute module membership"
+    ) +
+
+    theme_classic(base_size = 12) +
+
+    theme(
+      axis.text.y = element_text(
+        colour = "black",
+        size = 8
+      ),
+      axis.text.x = element_text(
+        colour = "black"
+      ),
+      plot.title = element_text(
+        face = "bold"
+      ),
+      legend.position = "right",
+      strip.text = element_text(
+        face = "bold",
+        size = 12
+      ),
+      panel.spacing = unit(1.2, "lines")
+    )
+
+  print(p_host_GSEA)
+
+  # ============================================================
+  # 6. SAVE SVG
+  # ============================================================
+
+  ggsave(
+    filename = "WGCNA/Host_CO2_correlated_modules_GO_BP_GSEA.svg",
+    plot = p_host_GSEA,
+    device = "svg",
+    width = 15,
+    height = 6,
+    units = "in",
+    bg = "white"
+  )
+
+} else {
+
+  message("No significant GO BP terms to plot.")
+
+}
+
+```
+
+```{r}
+# Extract module eigengenes and assign CO2 condition
+module_site_data <- data.frame(
+  Sample = rownames(host_ME),
+  ME13 = host_ME[, "ME13"],
+  ME24 = host_ME[, "ME24"]
+) %>%
+  mutate(
+    Site = ifelse(grepl("^C", Sample), "Reference", "Elevated CO2")
+  )
+
+# Summarise mean eigengene values by condition
+module_site_summary <- module_site_data %>%
+  pivot_longer(
+    cols = c(ME13, ME24),
+    names_to = "Module",
+    values_to = "Eigengene"
+  ) %>%
+  group_by(Module, Site) %>%
+  summarise(
+    Mean = mean(Eigengene, na.rm = TRUE),
+    SD = sd(Eigengene, na.rm = TRUE),
+    N = n(),
+    .groups = "drop"
+  )
+
+print(module_site_summary)
+
+# Calculate direction of the difference
+module_site_direction <- module_site_summary %>%
+  select(Module, Site, Mean) %>%
+  pivot_wider(names_from = Site, values_from = Mean) %>%
+  mutate(
+    Difference = `Elevated CO2` - Reference,
+    Direction = ifelse(
+      Difference > 0,
+      "Higher in Elevated CO2",
+      "Higher in Reference"
+    )
+  )
+
+print(module_site_direction)
+```
+
+```{r}
+dds_host$condition <- relevel(
+  factor(dds_host$condition),
+  ref = "Reference"
+)
+
+res_host_CO2 <- results(
+  dds_host,
+  contrast = c("condition", "Elevated CO2", "Reference")
+)
+```
+
+# Plot ME10 genes
+```{r}
+# ============================================================
+# 1. DESeq2 results: Elevated CO2 vs Reference
+# ============================================================
+
+de_gene_df <- as.data.frame(res_host_CO2) %>%
+  rownames_to_column("Transcript") %>%
+  mutate(
+    Gene = str_remove(Transcript, "\\.t\\d+$")
+  ) %>%
+  select(Gene, log2FoldChange, stat, pvalue, padj) %>%
+  group_by(Gene) %>%
+  slice_min(
+    order_by = padj,
+    n = 1,
+    with_ties = FALSE,
+    na_rm = TRUE
+  ) %>%
+  ungroup()
+
+
+# ============================================================
+# 2. Extract ALL genes belonging to host module ME10
+# ============================================================
+
+ME10_transcripts <- colnames(datExpr_host)[
+  host_net$colors == 10
+]
+
+ME10_genes <- unique(
+  str_remove(ME10_transcripts, "\\.t\\d+$")
+)
+
+genes_to_plot <- ME10_genes
+
+cat("ME10 transcripts:", length(ME10_transcripts), "\n")
+cat("Unique ME10 genes:", length(genes_to_plot), "\n")
+
+
+# ============================================================
+# 3. Extract variance-stabilised expression
+# ============================================================
+
+vst_mat <- assay(vsd_host)
+
+# Extract gene IDs and average transcript expression per gene
+vst_df <- as.data.frame(vst_mat) %>%
+  rownames_to_column("Transcript") %>%
+  mutate(
+    Gene = str_remove(Transcript, "\\.t\\d+$")
+  )
+
+sample_ids <- colnames(vst_mat)
+
+gene_expression <- vst_df %>%
+  select(Gene, all_of(sample_ids)) %>%
+  group_by(Gene) %>%
+  summarise(
+    across(all_of(sample_ids), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  filter(Gene %in% genes_to_plot)
+
+expression_mat <- gene_expression %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+cat("\nExpression matrix before sample matching:\n")
+print(dim(expression_mat))
+
+
+# ============================================================
+# 4. Match samples and order by condition
+# ============================================================
+
+vst_sample_ids <- data.frame(
+  SampleID = colnames(vst_mat),
+  UrchinID = str_extract(
+    colnames(vst_mat),
+    "(?<=_)[CH]\\d+(?=_)"
+  )
+)
+
+# Make sure metadata IDs are character and consistent
+metadata <- metadata %>%
+  mutate(
+    UrchinID = trimws(as.character(UrchinID)),
+    condition = trimws(as.character(condition))
+  )
+
+sample_annotation <- vst_sample_ids %>%
+  left_join(
+    metadata %>%
+      select(UrchinID, condition) %>%
+      distinct(),
+    by = "UrchinID"
+  )
+
+cat("\nUnmatched samples:\n")
+print(sample_annotation %>% filter(is.na(condition)))
+
+# Keep matched samples and order by condition
+sample_annotation <- sample_annotation %>%
+  filter(!is.na(condition)) %>%
+  mutate(
+    condition = factor(
+      condition,
+      levels = c("Reference", "Elevated CO2")
+    )
+  ) %>%
+  arrange(condition, UrchinID)
+
+# Reorder expression matrix to match annotation
+expression_mat <- expression_mat[
+  ,
+  sample_annotation$SampleID,
+  drop = FALSE
+]
+
+rownames(sample_annotation) <- sample_annotation$SampleID
+
+sample_annotation <- sample_annotation %>%
+  select(condition)
+
+cat("\nSamples per condition:\n")
+print(table(sample_annotation$condition, useNA = "ifany"))
+
+cat("\nExpression matrix dimensions after matching:\n")
+print(dim(expression_mat))
+
+cat("\nAnnotation dimensions:\n")
+print(dim(sample_annotation))
+
+# Stop if samples have not been retained correctly
+stopifnot(ncol(expression_mat) == nrow(sample_annotation))
+stopifnot(ncol(expression_mat) > 0)
+
+
+# ============================================================
+# 5. Clean expression matrix and calculate Z-scores
+# ============================================================
+
+expression_mat <- expression_mat[
+  apply(expression_mat, 1, function(x) all(is.finite(x))),
+  ,
+  drop = FALSE
+]
+
+gene_sd <- apply(expression_mat, 1, sd)
+
+expression_mat <- expression_mat[
+  is.finite(gene_sd) & gene_sd > 0,
+  ,
+  drop = FALSE
+]
+
+cat("\nVariable ME10 genes retained:\n")
+print(nrow(expression_mat))
+
+if (nrow(expression_mat) < 2) {
+  stop("Fewer than two variable genes remain. Check the expression matrix.")
+}
+
+# Row-wise Z-scores across all individual urchins
+expression_z <- t(scale(t(expression_mat)))
+
+
+# ============================================================
+# 6. Add DESeq2 annotation
+# ============================================================
+
+de_annotation <- tibble(
+  Gene = rownames(expression_z)
+) %>%
+  left_join(
+    de_gene_df %>%
+      mutate(
+        CO2_response = case_when(
+          !is.na(padj) & padj < 0.05 & log2FoldChange > 0 ~
+            "Higher under elevated CO2",
+          !is.na(padj) & padj < 0.05 & log2FoldChange < 0 ~
+            "Higher under reference",
+          TRUE ~ "Not significant"
+        )
+      ) %>%
+      select(Gene, CO2_response),
+    by = "Gene"
+  ) %>%
+  mutate(
+    CO2_response = coalesce(
+      CO2_response,
+      "No DESeq2 result"
+    )
+  ) %>%
+  column_to_rownames("Gene")
+
+
+
+# ============================================================
+# 7. Plot heatmap
+# ============================================================
+
+# Condition colours
+annotation_colors <- list(
+  condition = c(
+    "Reference" = "#2C728E",
+    "Elevated CO2" = "#D4476C"
+  )
+)
+
+# Z-score colours
+z_score_colors <- colorRampPalette(
+  c("#2e2eff", "#ffffff", "#ff0902")
+)(100)
+
+n_reference <- sum(sample_annotation$condition == "Reference")
+
+svglite(
+  "WGCNA/ME10_all_genes_heatmap.svg",
+  width = 10,
+  height = 7
+)
+
+pheatmap(
+  expression_z,
+  scale = "none",
+  color = z_score_colors,
+  breaks = seq(-2.5, 2.5, length.out = 101),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  clustering_distance_rows = "correlation",
+  clustering_method = "complete",
+  annotation_col = sample_annotation,
+  annotation_row = de_annotation,
+  annotation_colors = annotation_colors,
+  show_rownames = nrow(expression_z) <= 100,
+  show_colnames = FALSE,
+  fontsize_row = 6,
+  border_color = NA,
+  gaps_col = if (n_reference > 0 &&
+                 n_reference < ncol(expression_z)) n_reference else NULL,
+  main = "Host module ME10: expression across CO2 conditions"
+)
+
+dev.off()
+
+# ============================================================
+# 8. Add functional annotations to ME10 genes
+# ============================================================
+
+gene_annotations <- annotations %>%
+  mutate(
+    Gene = str_remove(query_name, "\\.t\\d+$")
+  ) %>%
+  select(
+    Gene,
+    Preferred_name,
+    Description
+  ) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+
+# ============================================================
+# 9. Create annotated ME10 gene table
+# ============================================================
+
+ME10_gene_table <- tibble(
+  Gene = ME10_genes
+) %>%
+  left_join(
+    gene_annotations,
+    by = "Gene"
+  ) %>%
+  left_join(
+    de_gene_df,
+    by = "Gene"
+  ) %>%
+  mutate(
+    CO2_response = case_when(
+      !is.na(padj) & padj < 0.05 & log2FoldChange > 0 ~
+        "Higher under elevated CO2",
+      !is.na(padj) & padj < 0.05 & log2FoldChange < 0 ~
+        "Higher under reference",
+      TRUE ~ "Not significant"
+    )
+  ) %>%
+  arrange(padj)
+
+
+# ============================================================
+# 10. Extract significant ME10 genes
+# ============================================================
+
+ME10_significant_genes <- ME10_gene_table %>%
+  filter(!is.na(padj), padj < 0.05) %>%
+  arrange(padj)
+
+View(ME10_significant_genes)
+```
+
+
+# Just plot ME_1 pathways
+
+```{r}
+
+# ============================================================
+# KEGG FUNCTIONAL REPERTOIRE AND ENRICHMENT IN BACTERIAL ME1
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(KEGGREST)
+library(ggplot2)
+library(tibble)
+
+
+# ============================================================
+# 1. ASSIGN ORFs TO WGCNA MODULES
+# ============================================================
+
+micro_membership <- tibble(
+  Transcript = colnames(datExpr_micro),
+  WGCNA_module = as.character(micro_net$colors)
+) %>%
+  filter(WGCNA_module != "0")
+
+# ORFs inherit the module of their parent transcript
+orf_membership <- eggnog_micro %>%
+  distinct(ORF) %>%
+  mutate(
+    Transcript = str_remove(ORF, "_[0-9]+$")
+  ) %>%
+  inner_join(
+    micro_membership,
+    by = "Transcript"
+  ) %>%
+  distinct(ORF, WGCNA_module)
+
+cat("\nORFs by WGCNA module:\n")
+print(table(orf_membership$WGCNA_module))
+
+
+# ============================================================
+# 2. EXTRACT KO ANNOTATIONS FROM BACTERIAL ORFs
+# ============================================================
+
+orf_KO <- eggnog_micro %>%
+  filter(
+    !is.na(KEGG_ko),
+    KEGG_ko != "-"
+  ) %>%
+  mutate(
+    KEGG_ko = str_replace_all(
+      KEGG_ko,
+      "\\s+",
+      ""
+    )
+  ) %>%
+  separate_rows(
+    KEGG_ko,
+    sep = ","
+  ) %>%
+  filter(
+    str_detect(
+      KEGG_ko,
+      "^ko:K[0-9]{5}$"
+    )
+  ) %>%
+  mutate(
+    KO = str_remove(KEGG_ko, "^ko:")
+  ) %>%
+  distinct(ORF, KO) %>%
+  inner_join(
+    orf_membership,
+    by = "ORF"
+  ) %>%
+  distinct(
+    ORF,
+    KO,
+    WGCNA_module
+  )
+
+cat("\nAnnotated ORFs:", n_distinct(orf_KO$ORF), "\n")
+cat("Unique KOs:", n_distinct(orf_KO$KO), "\n")
+
+
+# ============================================================
+# 3. RETRIEVE KEGG MODULE DEFINITIONS AND HIERARCHY
+# ============================================================
+
+# Retrieve KEGG module identifiers
+kegg_modules <- KEGGREST::keggList("module")
+
+module_ids <- names(kegg_modules) %>%
+  str_remove("^md:") %>%
+  unique()
+
+module_ids <- module_ids[
+  str_detect(module_ids, "^M[0-9]{5}$")
+]
+
+# KEGG REST accepts batches of up to 10 entries
+module_batches <- split(
+  module_ids,
+  ceiling(seq_along(module_ids) / 10)
+)
+
+module_entries <- unlist(
+  lapply(
+    module_batches,
+    function(ids) {
+      KEGGREST::keggGet(
+        paste0("md:", ids)
+      )
+    }
+  ),
+  recursive = FALSE
+)
+
+# Extract module name and broad/subclass hierarchy
+module_info <- bind_rows(
+  lapply(
+    module_entries,
+    function(entry) {
+
+      tibble(
+        Module = str_remove(
+          entry$ENTRY[1],
+          "^md:"
+        ),
+
+        Name = paste(
+          entry$NAME,
+          collapse = " "
+        ),
+
+        Class = if (
+          is.null(entry$CLASS)
+        ) {
+          NA_character_
+        } else {
+          paste(
+            entry$CLASS,
+            collapse = "; "
+          )
+        }
+      )
+    }
+  )
+) %>%
+  distinct(Module, .keep_all = TRUE)
+
+# Retrieve KO -> KEGG Module relationships
+module_KO <- KEGGREST::keggLink(
+  "ko",
+  "module"
+) %>%
+  tibble(
+    Module = names(.) %>%
+      str_remove("^md:"),
+
+    KO = unname(.) %>%
+      str_remove("^ko:")
+  ) %>%
+  filter(
+    str_detect(Module, "^M[0-9]{5}$")
+  ) %>%
+  distinct(Module, KO) %>%
+  inner_join(
+    module_info,
+    by = "Module"
+  ) %>%
+  distinct(Module, KO, .keep_all = TRUE)
+
+cat(
+  "\nKEGG pathway Modules retrieved:",
+  n_distinct(module_KO$Module),
+  "\n"
+)
+
+
+# ============================================================
+# 4. DEFINE ME1 ORFs, BACKGROUND AND MODULE ORF SETS
+# ============================================================
+
+# Background:
+# All KO-annotated ORFs assigned to non-grey WGCNA modules
+
+universe_ORF <- orf_KO %>%
+  distinct(ORF) %>%
+  pull(ORF)
+
+# Selected:
+# KO-annotated ORFs assigned to ME1
+
+selected_ORF <- orf_KO %>%
+  filter(WGCNA_module == "1") %>%
+  distinct(ORF) %>%
+  pull(ORF)
+
+# ME1 ORF-KO table
+ME1_KOs <- orf_KO %>%
+  filter(WGCNA_module == "1") %>%
+  distinct(ORF, KO)
+
+# Unique KOs represented in ME1
+ME1_KO_set <- unique(ME1_KOs$KO)
+
+# Assign ORFs to KEGG modules through their KOs
+orf_module <- orf_KO %>%
+  inner_join(
+    module_KO,
+    by = "KO"
+  ) %>%
+  distinct(
+    ORF,
+    Module,
+    Name,
+    Class
+  )
+
+# KEGG module-specific ORF sets
+module_sets <- orf_module %>%
+  filter(ORF %in% universe_ORF) %>%
+  group_by(
+    Module,
+    Name,
+    Class
+  ) %>%
+  summarise(
+    ORFs = list(unique(ORF)),
+    .groups = "drop"
+  )
+
+# Background and selected sample sizes
+N <- length(universe_ORF)
+n <- length(intersect(selected_ORF, universe_ORF))
+
+cat("\nBackground ORFs:", N, "\n")
+cat("ME1 ORFs:", n, "\n")
+
+
+# ============================================================
+# 5. KEGG MODULE OVERREPRESENTATION TEST
+# ============================================================
+
+enrichment_ME1 <- bind_rows(
+
+  lapply(
+    seq_len(nrow(module_sets)),
+    function(i) {
+
+      pathway_ORF <- module_sets$ORFs[[i]]
+
+      K <- length(
+        intersect(pathway_ORF, universe_ORF)
+      )
+
+      k <- length(
+        intersect(selected_ORF, pathway_ORF)
+      )
+
+      if (K < 3) {
+        return(NULL)
+      }
+
+      tibble(
+        Module = module_sets$Module[i],
+        N_background = N,
+        N_module_ORFs = K,
+        N_selected_ORFs = n,
+        N_overlap = k,
+
+        Fold_enrichment = ifelse(
+          k == 0,
+          0,
+          (k / n) / (K / N)
+        ),
+
+        pvalue = phyper(
+          q = k - 1,
+          m = K,
+          n = N - K,
+          k = n,
+          lower.tail = FALSE
+        )
+      )
+    }
+  )
+) %>%
+  mutate(
+    FDR = p.adjust(
+      pvalue,
+      method = "BH"
+    )
+  ) %>%
+  arrange(FDR)
+
+# Significantly enriched KEGG modules
+enrichment_sig_ME1 <- enrichment_ME1 %>%
+  filter(FDR < 0.05)
+
+cat(
+  "\nSignificantly enriched KEGG Modules:",
+  nrow(enrichment_sig_ME1),
+  "\n"
+)
+
+print(
+  enrichment_sig_ME1 %>%
+    select(
+      Module,
+      N_overlap,
+      N_module_ORFs,
+      Fold_enrichment,
+      pvalue,
+      FDR
+    )
+)
+
+
+# ============================================================
+# 6. CALCULATE KO REPRESENTATION IN ME1
+# ============================================================
+
+ME1_module_summary <- module_KO %>%
+  group_by(
+    Module,
+    Name,
+    Class
+  ) %>%
+  summarise(
+    Total_KOs = n_distinct(KO),
+
+    Observed_KOs = n_distinct(
+      KO[KO %in% ME1_KO_set]
+    ),
+
+    KO_coverage = Observed_KOs / Total_KOs * 100,
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(KO_coverage))
+
+View(ME1_module_summary)
+
+# ============================================================
+# 7. COUNT UNIQUE ME1 ORFs CONTRIBUTING TO EACH MODULE
+# ============================================================
+
+ME1_module_ORF_counts <- ME1_KOs %>%
+  inner_join(
+    module_KO,
+    by = "KO"
+  ) %>%
+  distinct(
+    Module,
+    ORF
+  ) %>%
+  count(
+    Module,
+    name = "N_ORFs"
+  )
+
+
+# ============================================================
+# 8. PREPARE PLOT DATA AND ADD ENRICHMENT ASTERISKS
+# ============================================================
+
+ME1_module_plotdata <- ME1_module_summary %>%
+
+  # Exclude selected disease- and organism-specific modules
+  filter(
+    !str_detect(
+      str_to_lower(
+        paste(Name, Class)
+      ),
+      "alzheimer|cancer|tumour|tumor|longevity.*worm|tuberculosis"
+    )
+  ) %>%
+
+  # Retain sufficiently represented KEGG modules
+  filter(
+    Total_KOs >= 3,
+    KO_coverage >= 20
+  ) %>%
+
+  left_join(
+    ME1_module_ORF_counts,
+    by = "Module"
+  ) %>%
+
+  # Join statistical enrichment results
+  left_join(
+    enrichment_ME1 %>%
+      select(
+        Module,
+        Fold_enrichment,
+        pvalue,
+        FDR,
+        N_overlap
+      ),
+    by = "Module"
+  ) %>%
+
+  mutate(
+    N_ORFs = replace_na(N_ORFs, 0),
+
+    Enriched = !is.na(FDR) & FDR < 0.05,
+
+    # Extract broad KEGG functional class
+    KEGG_Class = str_trim(
+      str_split_i(Class, ";", 2)
+    ),
+
+    KEGG_Class = factor(
+      KEGG_Class,
+      levels = c(
+        "Amino acid metabolism",
+        "Carbohydrate metabolism",
+        "Energy metabolism",
+        "Glycan metabolism",
+        "Metabolism of cofactors and vitamins",
+        "Nucleotide metabolism"
+      )
+    ),
+
+    # Add asterisk to significantly enriched modules
+    Label = paste0(
+      Module,
+      " | ",
+      Name,
+      ifelse(Enriched, " *", "")
+    )
+  ) %>%
+
+  arrange(KO_coverage) %>%
+
+  mutate(
+    Label = factor(
+      Label,
+      levels = Label
+    )
+  )
+
+
+# Inspect plot data
+View(
+  ME1_module_plotdata %>%
+    select(
+      Module,
+      Name,
+      KEGG_Class,
+      Observed_KOs,
+      Total_KOs,
+      KO_coverage,
+      N_ORFs,
+      Fold_enrichment,
+      FDR,
+      Enriched
+    )
+)
+
+
+# ============================================================
+# 9. PLOT ME1 FUNCTIONAL REPERTOIRE — LOLLIPOP
+# ============================================================
+
+ME1_repertoire_plot <- ggplot(
+  ME1_module_plotdata,
+  aes(
+    x = KO_coverage,
+    y = Label,
+    size = N_ORFs,
+    colour = KEGG_Class
+  )
+) +
+
+  geom_segment(
+    aes(
+      x = 0,
+      xend = KO_coverage,
+      y = Label,
+      yend = Label,
+      colour = KEGG_Class
+    ),
+    linewidth = 0.5,
+    alpha = 0.6
+  ) +
+
+  geom_point(
+    alpha = 0.9
+  ) +
+
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 25),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+
+  scale_size_continuous(
+    range = c(2.5, 8),
+    name = "ME1 ORFs"
+  ) +
+
+  scale_colour_manual(
+    values = c(
+      "Amino acid metabolism" = "#1B9E77",
+      "Carbohydrate metabolism" = "#D95F02",
+      "Energy metabolism" = "#7570B3",
+      "Glycan metabolism" = "#E7298A",
+      "Metabolism of cofactors and vitamins" = "#66A61E",
+      "Nucleotide metabolism" = "#E6AB02"
+    ),
+    name = "KEGG class",
+    drop = TRUE
+  ) +
+
+  labs(
+    x = "KO representation in ME1 (%)",
+    y = NULL,
+    title = "Functional repertoire of bacterial ME1"
+  ) +
+
+  theme_bw() +
+
+  theme(
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+print(ME1_repertoire_plot)
+
+
+# ============================================================
+# 10. SAVE SVG
+# ============================================================
+
+ggsave(
+  "WGCNA/ME1_KEGG_functional_repertoire.svg",
+  plot = ME1_repertoire_plot,
+  width = 11,
+  height = 6,
+  units = "in",
+  device = "svg"
+)
+
+
+# ============================================================
+# 11. EXPORT FUNCTIONAL REPERTOIRE TABLE
+# ============================================================
+
+ME1_functional_repertoire_table <- ME1_module_plotdata %>%
+  select(
+    Module,
+    Name,
+    Class,
+    KEGG_Class,
+    Observed_KOs,
+    Total_KOs,
+    KO_coverage,
+    N_ORFs,
+    Fold_enrichment,
+    pvalue,
+    FDR,
+    Enriched
+  ) %>%
+  arrange(desc(KO_coverage)) %>%
+  mutate(
+    KO_coverage = round(KO_coverage, 2),
+    Fold_enrichment = round(Fold_enrichment, 2)
+  )
+
+write.csv(
+  ME1_functional_repertoire_table,
+  "ME1_KEGG_functional_repertoire.csv",
+  row.names = FALSE
+)
+
+ME1_module_ORFs <- ME1_KOs %>%
+  inner_join(module_KO, by = "KO") %>%
+  distinct(Module, ORF) %>%
+  filter(Module %in% c("M00001", "M00002", "M00003"))
+
+# Pairwise overlap between modules
+module_overlap <- ME1_module_ORFs %>%
+  inner_join(
+    ME1_module_ORFs,
+    by = "ORF",
+    suffix = c("_1", "_2")
+  ) %>%
+  filter(Module_1 < Module_2) %>%
+  count(Module_1, Module_2, name = "Shared_ORFs")
+
+module_overlap
+
+```
+# Functional repertoire of the bacterial ME1 co-expression module. Representation of KEGG functional modules among the KEGG Orthology (KO) annotations identified in microbial WGCNA module ME1. Each point represents a KEGG module, with the x-axis indicating the percentage of its constituent KOs represented in ME1 (KO coverage). Only KEGG modules containing at least three KOs and showing ≥25% KO representation were included. Point size indicates the number of unique ME1 open reading frames (ORFs) associated with each KEGG module.
+
+
+```{r}
+# ============================================================
+# TEST WHETHER HOST–MICROBIOME MODULE COUPLING
+# DIFFERS BETWEEN REFERENCE AND ELEVATED CO2
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Align metadata and correctly encode treatment
+# ------------------------------------------------------------
+
+traits_aligned <- traits[
+  rownames(host_ME_bio),
+  ,
+  drop = FALSE
+]
+
+coupling_data <- data.frame(
+  Condition = factor(
+    traits_aligned$Condition,
+    levels = c(0, 1),
+    labels = c("Reference", "Elevated CO2")
+  )
+)
+
+# Check
+table(coupling_data$Condition)
+
+stopifnot(
+  all(table(coupling_data$Condition) > 0)
+)
+
+# ------------------------------------------------------------
+# 2. Test every host–microbiome module pair
+# ------------------------------------------------------------
+
+coupling_results <- map_dfr(
+  colnames(host_ME_bio),
+  function(host_module) {
+
+    map_dfr(
+      colnames(micro_ME_bio),
+      function(micro_module) {
+
+        dat <- coupling_data %>%
+          mutate(
+            HostME = host_ME_bio[, host_module],
+            MicroME = micro_ME_bio[, micro_module]
+          )
+
+        fit <- lm(
+          MicroME ~ HostME * Condition,
+          data = dat
+        )
+
+        coefficients <- summary(fit)$coefficients
+
+        interaction_term <- grep(
+          "HostME:Condition",
+          rownames(coefficients),
+          value = TRUE
+        )
+
+        tibble(
+          HostModule = host_module,
+          MicroModule = micro_module,
+
+          # Host-ME slope under Reference
+          Reference_slope =
+            coefficients["HostME", "Estimate"],
+
+          # Difference in slope under Elevated CO2
+          CO2_slope_difference =
+            coefficients[interaction_term, "Estimate"],
+
+          # Host-ME slope under Elevated CO2
+          Elevated_slope =
+            coefficients["HostME", "Estimate"] +
+            coefficients[interaction_term, "Estimate"],
+
+          Interaction_P =
+            coefficients[interaction_term, "Pr(>|t|)"]
+        )
+      }
+    )
+  }
+)
+
+# ------------------------------------------------------------
+# 3. Correct for multiple testing
+# ------------------------------------------------------------
+
+coupling_results <- coupling_results %>%
+  mutate(
+    Interaction_FDR = p.adjust(
+      Interaction_P,
+      method = "BH"
+    )
+  ) %>%
+  arrange(Interaction_FDR)
+
+# ------------------------------------------------------------
+# 4. Identify treatment-dependent associations
+# ------------------------------------------------------------
+
+coupling_results %>%
+  filter(Interaction_FDR < 0.05)
+
+# ------------------------------------------------------------
+# 5. Specifically inspect ME10 x ME1
+# ------------------------------------------------------------
+
+coupling_results %>%
+  filter(
+    HostModule == "ME10",
+    MicroModule == "ME1"
+  )
+
+```
+
+```{r}
+
+# ============================================================
+# GO GSEA FOR HOST MODULES ASSOCIATED WITH CO2 TREATMENT
+# ME24, ME3, ME13
+# ============================================================
+# Modules associated with CO2 treatment
+host_modules_CO2 <- c("ME24", "ME3", "ME13")
+
+# ------------------------------------------------------------
+# 1. Run GSEA for each module
+# ------------------------------------------------------------
+
+host_GSEA_CO2 <- list()
+
+for (ME_name in host_modules_CO2) {
+
+  # Calculate module membership (kME)
+  kME_values <- as.numeric(
+    cor(
+      datExpr_host,
+      host_ME[, ME_name],
+      use = "pairwise.complete.obs"
+    )
+  )
+
+  names(kME_values) <- colnames(datExpr_host)
+
+  # Rank genes by absolute module membership
+  geneList <- sort(
+    abs(kME_values),
+    decreasing = TRUE
+  )
+
+  # Convert transcript IDs to gene IDs
+  names(geneList) <- str_remove(
+    names(geneList),
+    "\\.t\\d+$"
+  )
+
+  # Remove duplicate gene IDs
+  geneList <- geneList[!duplicated(names(geneList))]
+
+  # Run GSEA
+  gsea_result <- GSEA(
+    geneList = geneList,
+    TERM2GENE = TERM2GENE_BP,
+    TERM2NAME = TERM2NAME_BP,
+    pvalueCutoff = 1,
+    minGSSize = 10,
+    maxGSSize = 500,
+    verbose = FALSE
+  )
+
+  # Store results
+  host_GSEA_CO2[[ME_name]] <- as.data.frame(gsea_result) %>%
+    mutate(Host_module = ME_name)
+}
+
+# ------------------------------------------------------------
+# 2. Combine results
+# ------------------------------------------------------------
+
+host_GSEA_CO2_results <- bind_rows(
+  host_GSEA_CO2
+)
+
+# ------------------------------------------------------------
+# 3. Significant GO terms
+# ------------------------------------------------------------
+
+host_GSEA_CO2_sig <- host_GSEA_CO2_results %>%
+  filter(p.adjust < 0.05) %>%
+  arrange(Host_module, p.adjust)
+
+# View results
+View(host_GSEA_CO2_sig)
+
+write.csv(
+  host_GSEA_CO2_sig,
+  "WGCNA/Host_CO2_Module_GO_GSEA_Significant.csv",
+  row.names = FALSE
+)
+```
+# It seems like the host modules which correlate with CO2 (but not microbes) are related to growth, division, regulation, sensing etc. NOT metabolism, digestion etc. So, the only module which strongly correlated with microbes is stuff to do with digestion and metabolism. Makes sense!
+
+# Functional enrichment analysis of host modules associated with CO₂ treatment revealed distinct but overlapping biological signatures. ME3, which was positively associated with Elevated CO₂, was enriched in processes related to DNA replication, DNA repair, meiotic and mitotic cell cycles, chromosome segregation and microtubule organisation. ME24, also positively associated with Elevated CO₂, exhibited a more restricted enrichment profile, including centrosomal protein localisation, RNA processing, centriole assembly and glucose catabolism. In contrast, ME13, which was negatively associated with Elevated CO₂, was predominantly enriched in processes associated with cilium and axoneme assembly, microtubule-based movement, cell projection organisation and vesicle-mediated transport and secretion. Collectively, these modules highlighted transcriptional patterns associated with cellular replication, microtubule organisation and intracellular transport, with distinct functional signatures corresponding to positive and negative associations with elevated CO₂.
+
+
+# Bacterial module correlated with CO2?
+```{r}
+
+# ============================================================
+# KEGG MODULE ENRICHMENT IN MICROBIAL WGCNA MODULE ME2
+# ============================================================
+
+library(dplyr)
+
+# ------------------------------------------------------------
+# 1. ME2 ORFs and background
+# ------------------------------------------------------------
+
+ME2_ORFs <- orf_KO %>%
+  filter(WGCNA_module == "2") %>%
+  distinct(ORF)
+
+background_ORFs <- orf_KO %>%
+  distinct(ORF)
+
+N <- n_distinct(background_ORFs$ORF)
+n <- n_distinct(ME2_ORFs$ORF)
+
+# ------------------------------------------------------------
+# 2. Calculate KEGG module enrichment
+# ------------------------------------------------------------
+
+ME2_module_summary <- module_KO %>%
+  group_by(Module) %>%
+  summarise(
+
+    Total_KOs = n_distinct(KO),
+
+    Observed_KOs = n_distinct(
+      KO[KO %in% ME2_KOs$KO]
+    ),
+
+    .groups = "drop"
+
+  ) %>%
+  rowwise() %>%
+  mutate(
+
+    # Background ORFs encoding KOs in this KEGG module
+    Background_ORFs = n_distinct(
+      orf_KO$ORF[
+        orf_KO$KO %in%
+          module_KO$KO[module_KO$Module == Module]
+      ]
+    ),
+
+    # ME2 ORFs encoding KOs in this KEGG module
+    Observed_ORFs = n_distinct(
+      ME2_KOs$ORF[
+        ME2_KOs$KO %in%
+          module_KO$KO[module_KO$Module == Module]
+      ]
+    ),
+
+    # Hypergeometric enrichment
+    Pvalue = phyper(
+      Observed_ORFs - 1,
+      Background_ORFs,
+      N - Background_ORFs,
+      n,
+      lower.tail = FALSE
+    ),
+
+    Fold_enrichment = (
+      Observed_ORFs / n
+    ) / (
+      Background_ORFs / N
+    )
+
+  ) %>%
+  ungroup() %>%
+  mutate(
+    FDR = p.adjust(Pvalue, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+# ------------------------------------------------------------
+# 3. Significant modules
+# ------------------------------------------------------------
+
+ME2_module_sig <- ME2_module_summary %>%
+  filter(FDR < 0.05)
+
+View(ME2_module_sig)
+
+```
+
+```{r}
+
+# ============================================================
+# MICROBIAL ME2 FUNCTIONAL REPERTOIRE
+# Top KEGG modules by KO coverage
+# ============================================================
+# ------------------------------------------------------------
+# 1. Summarise KO representation in ME2
+# ------------------------------------------------------------
+
+ME2_functional_repertoire <- module_KO %>%
+  group_by(Module) %>%
+  summarise(
+
+    Total_KOs = n_distinct(KO),
+
+    Observed_KOs = n_distinct(
+      KO[KO %in% ME2_KOs$KO]
+    ),
+
+    .groups = "drop"
+
+  ) %>%
+  mutate(
+    KO_coverage = Observed_KOs / Total_KOs
+  ) %>%
+  filter(Observed_KOs > 0) %>%
+  arrange(desc(KO_coverage))
+
+# ------------------------------------------------------------
+# 2. Add number of ME2 ORFs assigned to each KEGG module
+# ------------------------------------------------------------
+
+ME2_functional_repertoire <- ME2_functional_repertoire %>%
+  rowwise() %>%
+  mutate(
+    N_ORFs = n_distinct(
+      ME2_KOs$ORF[
+        ME2_KOs$KO %in%
+          module_KO$KO[module_KO$Module == Module]
+      ]
+    )
+  ) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# 3. Keep top 20 KEGG modules
+# ------------------------------------------------------------
+
+ME2_functional_repertoire_top20 <- ME2_functional_repertoire %>%
+  slice_max(
+    order_by = KO_coverage,
+    n = 20,
+    with_ties = TRUE
+  )
+
+# ============================================================
+# ADD KEGG MODULE DESCRIPTIONS TO ME2 TABLE
+# ============================================================
+
+
+# Retrieve KEGG module names
+kegg_module_names <- KEGGREST::keggList("module")
+
+kegg_module_names <- tibble(
+  Module = sub("^md:", "", names(kegg_module_names)),
+  Description = unname(kegg_module_names)
+)
+
+# Join descriptions to ME2 functional repertoire
+ME2_functional_repertoire_top20 <- ME2_functional_repertoire_top20 %>%
+  left_join(kegg_module_names, by = "Module") %>%
+  select(
+    Module,
+    Description,
+    Total_KOs,
+    Observed_KOs,
+    KO_coverage,
+    N_ORFs
+  )
+
+# View
+View(ME2_functional_repertoire_top20)
+
+```
+
