@@ -1,0 +1,1121 @@
+---
+title: "04a_AlphaDiversity"
+author: "Callum Hudson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Check sequencing depth of gut samples
+```{r}
+library(phyloseq)
+library(dplyr)
+
+depths <- data.frame(
+  Sample = sample_names(ps_gut_clean),
+  Reads = sample_sums(ps_gut_clean),
+  Condition = sample_data(ps_gut_clean)$Condition
+)
+
+depths %>%
+  group_by(Condition) %>%
+  summarise(
+    n = n(),
+    min = min(Reads),
+    Q1 = quantile(Reads, 0.25),
+    median = median(Reads),
+    mean = mean(Reads),
+    max = max(Reads),
+    .groups = "drop"
+  )
+
+summary(depths$Reads)
+```
+
+# Sequencing depth by site
+```{r}
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+depth_richness <- data.frame(
+  Sample = rownames(comm_asv),
+  Condition = sample_data(ps_gut_clean)$Condition[
+    match(rownames(comm_asv), sample_names(ps_gut_clean))
+  ],
+  Reads_ASV = rowSums(comm_asv),
+  Observed_ASV = rowSums(comm_asv > 0),
+  Reads_Genus = rowSums(comm_genus),
+  Observed_Genus = rowSums(comm_genus > 0)
+)
+
+depth_richness$Condition <- factor(
+  depth_richness$Condition,
+  levels = c("Reference", "Elevated CO2")
+)
+
+# Summary statistics
+depth_richness %>%
+  group_by(Condition) %>%
+  summarise(
+    n = n(),
+    min = min(Reads_ASV),
+    Q1 = quantile(Reads_ASV, 0.25),
+    median = median(Reads_ASV),
+    mean = mean(Reads_ASV),
+    max = max(Reads_ASV),
+    .groups = "drop"
+  )
+
+# ANOVA
+aov_depth <- aov(Reads_ASV ~ Condition, data = depth_richness)
+summary(aov_depth)
+
+# Levene's test
+car::leveneTest(Reads_ASV ~ Condition, data = depth_richness)
+
+# Does not statistically differ between sites
+```
+
+# Box plot
+```{r}
+depth_plot <- ggplot(
+  depth_richness,
+  aes(x = Condition, y = Reads_ASV)
+) +
+  geom_boxplot(aes(fill = Condition, colour = Condition)) +
+  geom_jitter(
+    aes(fill = Condition, colour = Condition),
+    shape = 21,
+    width = 0.1,
+    size = 2.5,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(
+    values = disp.pal1,
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+  scale_colour_manual(
+    values = disp.pal2,
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+  scale_x_discrete(
+    name = "Site",
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+  scale_y_continuous(
+    name = "Sequencing depth (reads)",
+    breaks = scales::pretty_breaks(n = 5),
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.title.x = element_blank(),
+    panel.border = element_rect(
+      fill = NA, colour = "black", linewidth = 1
+    ),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+depth_plot
+```
+
+# Sequencing depth versus observed richness
+```{r}
+# Convert to long format
+richness_depth_long <- depth_richness %>%
+  select(
+    Condition,
+    Reads_ASV,
+    Observed_ASV,
+    Reads_Genus,
+    Observed_Genus
+  ) %>%
+  pivot_longer(
+    cols = -Condition,
+    names_to = c(".value", "Taxonomic_level"),
+    names_pattern = "(Reads|Observed)_(ASV|Genus)"
+  ) %>%
+  rename(
+    Reads = Reads,
+    Richness = Observed
+  ) %>%
+  mutate(
+    Taxonomic_level = factor(
+      Taxonomic_level,
+      levels = c("ASV", "Genus")
+    )
+  )
+
+# Plot
+richness_depth_plot <- ggplot(
+  richness_depth_long,
+  aes(x = Reads, y = Richness, colour = Condition)
+) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_smooth(
+    aes(group = Condition),
+    method = "lm",
+    formula = y ~ x,
+    se = TRUE
+  ) +
+  scale_colour_manual(
+    values = disp.pal2,
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+  facet_wrap(
+    ~Taxonomic_level,
+    scales = "free",
+    ncol = 2
+  ) +
+  scale_x_continuous(
+    name = "Sequencing depth (reads)",
+    breaks = scales::pretty_breaks(n = 5)
+  ) +
+  scale_y_continuous(
+    name = "Observed richness",
+    breaks = scales::pretty_breaks(n = 5)
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.border = element_rect(
+      fill = NA, colour = "black", linewidth = 1
+    ),
+    legend.title = element_blank()
+  )
+
+richness_depth_plot
+```
+
+# Is richess correlated with sequencing depth?
+```{r}
+# ASV-level
+model_asv <- lm(
+  Observed_ASV ~ Reads_ASV * Condition,
+  data = depth_richness
+)
+
+summary(model_asv)
+
+# Genus-level
+model_genus <- lm(
+  Observed_Genus ~ Reads_Genus * Condition,
+  data = depth_richness
+)
+
+summary(model_genus)
+```
+
+
+# Check rarefaction curves
+```{r}
+library(phyloseq)
+library(vegan)
+
+# --------------------------------------------------
+# Convert phyloseq objects to sample x taxa matrices
+# --------------------------------------------------
+
+get_comm <- function(ps) {
+
+  otu <- as(otu_table(ps), "matrix")
+
+  if (taxa_are_rows(ps)) {
+    otu <- t(otu)
+  }
+
+  otu
+}
+
+# ASV-level community matrix
+comm_asv <- get_comm(ps_gut_clean)
+
+# Genus-level community matrix
+ps_genus <- tax_glom(
+  ps_gut_clean,
+  taxrank = "Genus",
+  NArm = TRUE
+)
+
+comm_genus <- get_comm(ps_genus)
+
+# --------------------------------------------------
+# Rarefaction curves
+# --------------------------------------------------
+
+par(mfrow = c(1, 2))
+
+rarecurve(
+  comm_asv,
+  step = 5000,
+  sample = 74184,
+  label = FALSE,
+  xlab = "Sequencing depth",
+  ylab = "Observed ASV richness",
+  main = "ASV richness"
+)
+
+rarecurve(
+  comm_genus,
+  step = 5000,
+  sample = 74184,
+  label = FALSE,
+  xlab = "Sequencing depth",
+  ylab = "Observed genus richness",
+  main = "Genus richness"
+)
+
+par(mfrow = c(1, 1))
+```
+
+# Old
+# Alpha Diversity Plots
+```{r}
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# conflicts with phyloseq
+unloadNamespace("philr")
+unloadNamespace("ggtree")
+unloadNamespace("treeio")
+unloadNamespace("tidytree")
+
+sample_data(ps_gut_clean)
+alpha_diversity <- estimate_richness(tax_glom(ps_gut_clean, taxrank = "Genus"), measure = c("Shannon", "Observed"))
+names(alpha_diversity)[names(alpha_diversity) == "Observed"] <- "Richness"
+names(alpha_diversity)[names(alpha_diversity) == "Shannon"] <- "Diversity"
+alpha_diversity$Evenness <- alpha_diversity$Diversity / log(alpha_diversity$Richness)
+alpha_diversity <- data.frame(alpha_diversity, sample_data(ps_gut_clean))
+
+alpha_long <- alpha_diversity %>%
+  pivot_longer(cols = c(Diversity, Richness, Evenness),
+               names_to = "Measure", values_to = "Value") %>%
+mutate(Site = factor(Condition, levels = c("Reference", "Elevated CO2")))
+
+# --- Pivot and recode alpha diversity ---
+alpha_long <- alpha_diversity %>%
+  pivot_longer(
+    cols = c(Diversity, Richness, Evenness),
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Site = factor(Condition,
+      levels = c("Reference", "Elevated CO2")
+    )
+  )
+
+# Map old names to final facet labels
+measure_labels <- c(
+  "Evenness" = "Evenness",
+  "Richness" = "Richness",
+  "Diversity" = "Shannon"
+)
+
+# Apply mapping and set factor levels
+alpha_long$Measure <- factor(measure_labels[alpha_long$Measure],
+                             levels = c("Evenness", "Richness", "Shannon"))
+
+# --- Plot ---
+disp.pal1 <- c("#2C728E", "#D4476C") 
+disp.pal2 <- c("#1F4E64", "#9B3654")
+
+library(ggpubr)
+
+# Significance based on ANOVA (chunk below)
+sig_df <- data.frame(
+  Measure = c("Evenness", "Shannon"),
+  group1 = c("Reference", "Reference"),
+  group2 = c("Elevated CO2", "Elevated CO2"),
+  y.position = c(0.47, 2.4),
+  label = c("**", "**")
+)
+
+combined_alpha_plots <- ggplot(alpha_long, aes(x = Site, y = Value)) + 
+  stat_boxplot(aes(colour = Site), geom = 'errorbar', alpha = 1) + 
+  geom_boxplot(aes(fill = Site, colour = Site)) +
+  geom_jitter(aes(fill = Site, colour = Site),
+              shape = 21, width = 0.1, size = 2.5, alpha = 0.8,
+              show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 23, size = 2.5, colour = "black", fill = "white",
+               position = position_dodge(width = 0.75),
+               show.legend = FALSE) +
+  scale_fill_manual(values = disp.pal1,
+                    labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_colour_manual(values = disp.pal2,
+                      labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_x_discrete(name = "Site",
+                   labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_y_continuous(
+  name = "Alpha Diversity Measure",
+  breaks = scales::pretty_breaks(n = 5),
+  expand = expansion(mult = c(0.5, 0.5))
+) +
+  facet_wrap(~Measure, scales = "free", ncol = 3) +
+  stat_pvalue_manual(
+    sig_df,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    inherit.aes = FALSE,
+    tip.length = 0.01,
+    bracket.size = 0.5
+  ) + theme_classic(base_size = 14) +
+  theme(axis.title.x = element_blank(),
+        panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+        legend.position = "none",
+        plot.title = element_text(size = 14),
+        axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+
+# --- Show plot ---
+combined_alpha_plots
+
+# --- Save plot ---
+ggsave("Figures_Alpha_Beta_div/combined_alpha_plots_clean.svg", combined_alpha_plots,
+       width = 23, height = 12, units = "cm", dpi = 900)
+```
+
+#Stats
+```{r}
+library(car)
+
+leveneTest(Richness ~ Condition, data = alpha_diversity) #NS = assumptions met
+anov_richness_tissue <- aov(Richness ~ Condition, data = alpha_diversity) 
+summary(anov_richness_tissue)
+#p adj ns
+
+leveneTest(Evenness ~ Condition, data = alpha_diversity) #NS = assumptions met
+anov_evenness_tissue <- aov(Evenness ~ Condition, data = alpha_diversity)
+summary(anov_evenness_tissue)
+# p adj = 0.00317 **
+
+leveneTest(Diversity ~ Condition, data = alpha_diversity) #NS = assumptions met
+anov_shannon_tissue <- aov(Diversity ~ Condition, data = alpha_diversity)
+summary(anov_shannon_tissue)
+# p adj 0.00492 **
+
+# No differences in gut community Richness
+# Higher Evenness and Shannon Diversity in Elevated CO2
+
+par(mfrow = c(1,3))
+
+qqnorm(residuals(anov_richness_tissue))
+qqline(residuals(anov_richness_tissue))
+
+qqnorm(residuals(anov_evenness_tissue))
+qqline(residuals(anov_evenness_tissue))
+
+qqnorm(residuals(anov_shannon_tissue))
+qqline(residuals(anov_shannon_tissue))
+
+par(mfrow = c(1,1))
+
+```
+
+
+
+
+# Updated following reviewer comments
+```{r}
+rarefaction_depth <- min(sample_sums(ps_gut_clean))
+rarefaction_depth
+
+# Alpha diversity: ASV and genus levels
+
+library(phyloseq)
+library(vegan)
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# --------------------------------------------------
+# Community matrices
+# --------------------------------------------------
+
+get_comm <- function(ps) {
+
+  otu <- as(otu_table(ps), "matrix")
+
+  if (taxa_are_rows(ps)) {
+    otu <- t(otu)
+  }
+
+  otu
+}
+
+# ASV-level
+comm_asv <- get_comm(ps_gut_clean)
+
+# Genus-level
+ps_genus <- tax_glom(
+  ps_gut_clean,
+  taxrank = "Genus",
+  NArm = TRUE
+)
+
+comm_genus <- get_comm(ps_genus)
+
+
+# --------------------------------------------------
+# Richness: rarefied to common sequencing depth
+# --------------------------------------------------
+
+rarefaction_depth <- min(
+  min(rowSums(comm_asv)),
+  min(rowSums(comm_genus))
+)
+
+richness_asv <- vegan::rarefy(
+  comm_asv,
+  sample = rarefaction_depth
+)
+
+richness_genus <- vegan::rarefy(
+  comm_genus,
+  sample = rarefaction_depth
+)
+
+
+# --------------------------------------------------
+# Evenness: Smith-Wilson Evar
+# --------------------------------------------------
+
+calculate_evar <- function(x) {
+
+  x <- x[x > 0]
+
+  if (length(x) < 2) {
+    return(NA_real_)
+  }
+
+  1 - (2 / pi) * atan(var(log(x)))
+}
+
+evenness_asv <- apply(comm_asv, 1, calculate_evar)
+
+evenness_genus <- apply(comm_genus, 1, calculate_evar)
+
+
+# --------------------------------------------------
+# Combine metrics and metadata
+# --------------------------------------------------
+
+alpha_diversity <- data.frame(
+  Sample = rownames(comm_asv),
+  Richness_ASV = as.numeric(richness_asv),
+  Richness_Genus = as.numeric(richness_genus),
+  Evenness_ASV = as.numeric(evenness_asv),
+  Evenness_Genus = as.numeric(evenness_genus)
+) %>%
+  left_join(
+    data.frame(sample_data(ps_gut_clean)) %>%
+      rownames_to_column("Sample"),
+    by = "Sample"
+  )
+```
+
+# Check if rarefaction solved the sequencing-depth induced richness bias
+```{r}
+depth_richness_asv <- data.frame(
+  Sample = rownames(comm_asv),
+  Reads_ASV = rowSums(comm_asv),
+  Observed_ASV = rowSums(comm_asv > 0),
+  Rarefied_ASV = as.numeric(richness_asv)
+) %>%
+  left_join(
+    data.frame(sample_data(ps_gut_clean)) %>%
+      rownames_to_column("Sample"),
+    by = "Sample"
+  )
+
+
+ggplot(
+  depth_richness_asv,
+  aes(x = Reads_ASV, y = Rarefied_ASV, colour = Condition)
+) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_smooth(
+    aes(group = Condition),
+    method = "lm",
+    formula = y ~ x,
+    se = TRUE
+  ) +
+  scale_colour_manual(
+    values = disp.pal2,
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+  scale_x_continuous(
+    name = "Original sequencing depth (reads)",
+    breaks = scales::pretty_breaks(n = 5)
+  ) +
+  scale_y_continuous(
+    name = "Expected ASV richness (rarefied)",
+    breaks = scales::pretty_breaks(n = 5)
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.border = element_rect(
+      fill = NA, colour = "black", linewidth = 1
+    ),
+    legend.title = element_blank()
+  )
+
+depth_richness_asv <- depth_richness_asv %>%
+  mutate(
+    Reads_c = Reads_ASV - mean(Reads_ASV)
+  )
+
+model_rarefied_asv <- lm(
+  Rarefied_ASV ~ Reads_c * Condition,
+  data = depth_richness_asv
+)
+
+summary(model_rarefied_asv)
+
+anova(model_rarefied_asv)
+```
+
+
+
+```{r}
+# Keep only the four new metrics and metadata
+alpha_diversity <- alpha_diversity %>%
+  select(
+    Sample,
+    Condition,
+    Richness_ASV,
+    Evenness_ASV,
+    Richness_Genus,
+    Evenness_Genus
+  )
+
+alpha_long <- alpha_diversity %>%
+  select(
+    Condition,
+    Richness_ASV,
+    Evenness_ASV,
+    Richness_Genus,
+    Evenness_Genus
+  ) %>%
+  pivot_longer(
+    cols = -Condition,
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Site = factor(
+      Condition,
+      levels = c("Reference", "Elevated CO2")
+    ),
+    Measure = factor(
+      Measure,
+      levels = c(
+        "Richness_ASV",
+        "Evenness_ASV",
+        "Richness_Genus",
+        "Evenness_Genus"
+      ),
+      labels = c(
+        "ASV-level richness",
+        "ASV-level evenness",
+        "Genus-level richness",
+        "Genus-level evenness"
+      )
+    )
+  )
+```
+
+```{r}
+library(car)
+
+# ASV richness
+leveneTest(Richness_ASV ~ Condition, data = alpha_diversity)
+anov_richness_asv <- aov(Richness_ASV ~ Condition, data = alpha_diversity)
+summary(anov_richness_asv)
+
+# ASV evenness
+leveneTest(Evenness_ASV ~ Condition, data = alpha_diversity)
+anov_evenness_asv <- aov(Evenness_ASV ~ Condition, data = alpha_diversity)
+summary(anov_evenness_asv)
+
+# Genus richness
+leveneTest(Richness_Genus ~ Condition, data = alpha_diversity)
+anov_richness_genus <- aov(Richness_Genus ~ Condition, data = alpha_diversity)
+summary(anov_richness_genus)
+
+# Genus evenness
+leveneTest(Evenness_Genus ~ Condition, data = alpha_diversity)
+anov_evenness_genus <- aov(Evenness_Genus ~ Condition, data = alpha_diversity)
+summary(anov_evenness_genus)
+```
+
+
+```{r}
+# Significance based on ANOVA (chunk below)
+sig_df <- data.frame(
+  Measure = c(
+    "ASV-level richness",
+    "ASV-level evenness",
+    "Genus-level richness",
+    "Genus-level evenness"
+  ),
+  group1 = rep("Reference", 4),
+  group2 = rep("Elevated CO2", 4),
+  y.position = c(1300, 0.3, 175, 0.2),
+  label = c("ns", "ns", "ns", "ns")
+)
+
+# Ensure the desired panel order
+alpha_long$Measure <- factor(
+  alpha_long$Measure,
+  levels = c(
+    "ASV-level richness",
+    "ASV-level evenness",
+    "Genus-level richness",
+    "Genus-level evenness"
+  )
+)
+
+combined_alpha_plots <- ggplot(alpha_long, aes(x = Site, y = Value)) + 
+  stat_boxplot(aes(colour = Site), geom = "errorbar", alpha = 1) + 
+  geom_boxplot(aes(fill = Site, colour = Site)) +
+  geom_jitter(aes(fill = Site, colour = Site),
+              shape = 21, width = 0.1, size = 2.5, alpha = 0.8,
+              show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 23, size = 2.5, colour = "black", fill = "white",
+               position = position_dodge(width = 0.75),
+               show.legend = FALSE) +
+  scale_fill_manual(values = disp.pal1,
+                    labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_colour_manual(values = disp.pal2,
+                      labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_x_discrete(name = "Site",
+                   labels = c("Reference", expression("Elevated CO"[2]))) +
+  scale_y_continuous(
+    name = "Alpha Diversity Measure",
+    breaks = scales::pretty_breaks(n = 5),
+    expand = expansion(mult = c(0.5, 0.5))
+  ) +
+  facet_wrap(
+  ~Measure,
+  scales = "free",
+  ncol = 4,
+  dir = "h",
+  as.table = TRUE
+) +
+  stat_pvalue_manual(
+    sig_df,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    inherit.aes = FALSE,
+    tip.length = 0.01,
+    bracket.size = 0.5
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.title.x = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 1),
+    legend.position = "none",
+    plot.title = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+combined_alpha_plots
+
+ggsave("Figures_Alpha_Beta_div/Updated_combined_alpha_plots.svg", combined_alpha_plots,
+       width = 24, height = 12, units = "cm", dpi = 900)
+```
+
+# Trying with unrarefied data
+```{r}
+
+# ============================================================
+# ALPHA DIVERSITY: UNRAREFIED ASV- AND GENUS-LEVEL DATA
+# ============================================================
+
+library(phyloseq)
+library(vegan)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(car)
+library(ggplot2)
+library(ggpubr)
+
+# ------------------------------------------------------------
+# Community matrices
+# ------------------------------------------------------------
+
+get_comm_unrare <- function(ps) {
+
+  otu <- as(otu_table(ps), "matrix")
+
+  if (taxa_are_rows(ps)) {
+    otu <- t(otu)
+  }
+
+  otu
+}
+
+# ASV-level: original, unrarefied data
+comm_asv_unrare <- get_comm_unrare(ps_gut_clean)
+
+# Genus-level: original counts aggregated by genus
+ps_genus_unrare <- tax_glom(
+  ps_gut_clean,
+  taxrank = "Genus",
+  NArm = TRUE
+)
+
+comm_genus_unrare <- get_comm_unrare(ps_genus_unrare)
+
+
+# ------------------------------------------------------------
+# Richness: observed taxa (no rarefaction)
+# ------------------------------------------------------------
+
+richness_asv_unrare <- rowSums(comm_asv_unrare > 0)
+
+richness_genus_unrare <- rowSums(comm_genus_unrare > 0)
+
+
+# ------------------------------------------------------------
+# Evenness: Smith-Wilson Evar
+# ------------------------------------------------------------
+
+calculate_evar_unrare <- function(x) {
+
+  x <- x[x > 0]
+
+  if (length(x) < 2) {
+    return(NA_real_)
+  }
+
+  1 - (2 / pi) * atan(var(log(x)))
+}
+
+evenness_asv_unrare <- apply(
+  comm_asv_unrare,
+  1,
+  calculate_evar_unrare
+)
+
+evenness_genus_unrare <- apply(
+  comm_genus_unrare,
+  1,
+  calculate_evar_unrare
+)
+
+
+# ------------------------------------------------------------
+# Combine metrics and metadata
+# ------------------------------------------------------------
+
+alpha_diversity_unrare <- data.frame(
+  Sample = rownames(comm_asv_unrare),
+  Richness_ASV_unrare = as.numeric(richness_asv_unrare),
+  Richness_Genus_unrare = as.numeric(richness_genus_unrare),
+  Evenness_ASV_unrare = as.numeric(evenness_asv_unrare),
+  Evenness_Genus_unrare = as.numeric(evenness_genus_unrare)
+) %>%
+  left_join(
+    data.frame(sample_data(ps_gut_clean)) %>%
+      rownames_to_column("Sample"),
+    by = "Sample"
+  ) %>%
+  select(
+    Sample,
+    Condition,
+    Richness_ASV_unrare,
+    Evenness_ASV_unrare,
+    Richness_Genus_unrare,
+    Evenness_Genus_unrare
+  )
+
+
+# ------------------------------------------------------------
+# Long format for plotting
+# ------------------------------------------------------------
+
+alpha_long_unrare <- alpha_diversity_unrare %>%
+  select(
+    Condition,
+    Richness_ASV_unrare,
+    Evenness_ASV_unrare,
+    Richness_Genus_unrare,
+    Evenness_Genus_unrare
+  ) %>%
+  pivot_longer(
+    cols = -Condition,
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Site = factor(
+      Condition,
+      levels = c("Reference", "Elevated CO2")
+    ),
+    Measure = factor(
+      Measure,
+      levels = c(
+        "Richness_ASV_unrare",
+        "Evenness_ASV_unrare",
+        "Richness_Genus_unrare",
+        "Evenness_Genus_unrare"
+      ),
+      labels = c(
+        "ASV-level richness",
+        "ASV-level evenness",
+        "Genus-level richness",
+        "Genus-level evenness"
+      )
+    )
+  )
+
+
+# ------------------------------------------------------------
+# Statistical tests: Levene's tests and ANOVAs
+# ------------------------------------------------------------
+
+# ASV richness
+levene_asv_richness_unrare <- leveneTest(
+  Richness_ASV_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+anova_asv_richness_unrare <- aov(
+  Richness_ASV_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+summary(anova_asv_richness_unrare)
+
+
+# ASV evenness
+levene_asv_evenness_unrare <- leveneTest(
+  Evenness_ASV_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+anova_asv_evenness_unrare <- aov(
+  Evenness_ASV_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+summary(anova_asv_evenness_unrare)
+
+
+# Genus richness
+levene_genus_richness_unrare <- leveneTest(
+  Richness_Genus_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+anova_genus_richness_unrare <- aov(
+  Richness_Genus_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+summary(anova_genus_richness_unrare)
+
+
+# Genus evenness
+levene_genus_evenness_unrare <- leveneTest(
+  Evenness_Genus_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+anova_genus_evenness_unrare <- aov(
+  Evenness_Genus_unrare ~ Condition,
+  data = alpha_diversity_unrare
+)
+
+summary(anova_genus_evenness_unrare)
+
+
+# ------------------------------------------------------------
+# Collect ANOVA results
+# ------------------------------------------------------------
+
+anova_results_unrare <- data.frame(
+  Measure = c(
+    "ASV-level richness",
+    "ASV-level evenness",
+    "Genus-level richness",
+    "Genus-level evenness"
+  ),
+  p_value = c(
+    summary(anova_asv_richness_unrare)[[1]][["Pr(>F)"]][1],
+    summary(anova_asv_evenness_unrare)[[1]][["Pr(>F)"]][1],
+    summary(anova_genus_richness_unrare)[[1]][["Pr(>F)"]][1],
+    summary(anova_genus_evenness_unrare)[[1]][["Pr(>F)"]][1]
+  )
+)
+
+anova_results_unrare
+
+
+# ------------------------------------------------------------
+# Significance labels for figure
+# ------------------------------------------------------------
+
+alpha_y_positions_unrare <- alpha_long_unrare %>%
+  group_by(Measure) %>%
+  summarise(
+    y.position = max(Value, na.rm = TRUE) * 1.15,
+    .groups = "drop"
+  )
+
+sig_df_unrare <- anova_results_unrare %>%
+  left_join(alpha_y_positions_unrare, by = "Measure") %>%
+  mutate(
+    group1 = "Reference",
+    group2 = "Elevated CO2",
+    label = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    )
+  )
+
+sig_df_unrare
+
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+alpha_long_unrare$Measure <- factor(
+  alpha_long_unrare$Measure,
+  levels = c(
+    "ASV-level richness",
+    "ASV-level evenness",
+    "Genus-level richness",
+    "Genus-level evenness"
+  )
+)
+
+combined_alpha_plots_unrare <- ggplot(
+  alpha_long_unrare,
+  aes(x = Site, y = Value)
+) +
+
+  stat_boxplot(
+    aes(colour = Site),
+    geom = "errorbar",
+    alpha = 1
+  ) +
+
+  geom_boxplot(
+    aes(fill = Site, colour = Site)
+  ) +
+
+  geom_jitter(
+    aes(fill = Site, colour = Site),
+    shape = 21,
+    width = 0.1,
+    size = 2.5,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 23,
+    size = 2.5,
+    colour = "black",
+    fill = "white",
+    position = position_dodge(width = 0.75),
+    show.legend = FALSE
+  ) +
+
+  scale_fill_manual(
+    values = disp.pal1,
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+
+  scale_colour_manual(
+    values = disp.pal2,
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+
+  scale_x_discrete(
+    name = "Site",
+    labels = c("Reference", expression("Elevated CO"[2]))
+  ) +
+
+  scale_y_continuous(
+    name = "Alpha Diversity Measure",
+    breaks = scales::pretty_breaks(n = 5),
+    expand = expansion(mult = c(0.05, 0.20))
+  ) +
+
+  facet_wrap(
+    ~Measure,
+    scales = "free",
+    ncol = 4,
+    dir = "h",
+    as.table = TRUE
+  ) +
+
+  stat_pvalue_manual(
+    sig_df_unrare,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    inherit.aes = FALSE,
+    tip.length = 0.01,
+    bracket.size = 0.5
+  ) +
+
+  theme_classic(base_size = 14) +
+
+  theme(
+    axis.title.x = element_blank(),
+    panel.border = element_rect(
+      fill = NA,
+      colour = "black",
+      linewidth = 1
+    ),
+    legend.position = "none",
+    plot.title = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+# Display figure
+combined_alpha_plots_unrare
+
+
+# ------------------------------------------------------------
+# Save figure
+# ------------------------------------------------------------
+
+ggsave(
+  "Figures_Alpha_Beta_div/Updated_combined_alpha_plots_UNRAREFIED.svg",
+  combined_alpha_plots_unrare,
+  width = 24,
+  height = 12,
+  units = "cm",
+  dpi = 900
+)
+
+```
+
